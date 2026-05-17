@@ -1,0 +1,11 @@
+# MuseTalk extras — install inside MuseTalk/ via setup-musetalk.sh.
+# Coqui TTS on the same venv: keep numpy==1.22.0; MuseTalk may want torch 2.x — test on Kaggle.
+# If Coqui breaks after MuseTalk setup, use two venvs or run MuseTalk in a subprocess only.
+
+opencv-python-headless>=4.8,<5
+omegaconf>=2.3
+transformers>=4.36
+diffusers>=0.25
+accelerate>=0.25
+einops
+imageio[ffmpeg]

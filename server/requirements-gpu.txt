@@ -1,0 +1,8 @@
+# Coqui TTS on Python 3.10/3.11 — TTS 0.22 pins numpy==1.22.0 on Py3.10
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0.0
+numpy==1.22.0
+TTS==0.22.0
+torch>=2.0.0,<2.3.0
+torchaudio>=2.0.0,<2.3.0

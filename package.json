@@ -1,0 +1,24 @@
+{
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "dev:server": "node server/index.js",
+    "dev:gpu-server": "USE_GPU_MODEL=1 GPU_MODEL_URL=http://127.0.0.1:5000 node server/index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "@mediapipe/tasks-vision": "^0.10.35",
+    "chrono-node": "^2.9.1",
+    "fuse.js": "^7.3.0",
+    "pixi.js": "^8.18.1",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "react-speech-recognition": "^4.0.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "vite": "^6.4.2"
+  }
+}

@@ -1,0 +1,2 @@
+# Default: GPU Coqui (Python 3.10/11). For Kaggle Python 3.12 use requirements-kaggle.txt
+-r requirements-gpu.txt

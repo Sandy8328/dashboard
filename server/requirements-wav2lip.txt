@@ -1,0 +1,5 @@
+# Wav2Lip extras — ALWAYS keep numpy==1.22.0 (Coqui TTS 0.22 on Py3.10).
+numpy==1.22.0
+opencv-python-headless==4.8.1.78
+librosa==0.10.0
+tqdm>=4.64.0

@@ -1,0 +1,7 @@
+# Kaggle / Python 3.12 — CPU Edge TTS (no Coqui). Still returns PCM for the dashboard.
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0.0
+numpy>=1.26.0,<2.1.0
+edge-tts>=6.1.0
+gTTS>=2.5.0
