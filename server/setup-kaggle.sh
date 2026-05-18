@@ -71,6 +71,7 @@ if [ "$VER" = "3.10" ] || [ "$VER" = "3.11" ]; then
   echo "Installing GPU Coqui TTS (requirements-gpu.txt, numpy 1.22 for TTS)..."
   PIP install "numpy==1.22.0"
   PIP install -r requirements-gpu.txt
+  echo "Edge TTS (male fallback) included in requirements-gpu.txt"
   TTS_BACKEND=coqui
 else
   echo "Python $VER — Coqui needs 3.10/3.11. Using Edge TTS instead..."
