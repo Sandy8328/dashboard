@@ -9,7 +9,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-MODEL_NAME = os.environ.get("TTS_MODEL", "tts_models/en/ljspeech/tacotron2-DDC")
+# Default male multi-speaker (VCTK). Legacy female default: tts_models/en/ljspeech/tacotron2-DDC
+MODEL_NAME = os.environ.get("TTS_MODEL", "tts_models/en/vctk/vits")
+TTS_SPEAKER = os.environ.get("TTS_SPEAKER", "p229")
 USE_GPU = os.environ.get("GPU", "1").lower() in ("1", "true", "yes")
 SAMPLE_RATE = 22050
 LIP_FPS = int(os.environ.get("LIP_FPS", "50"))
@@ -157,10 +159,55 @@ def _mp3_to_pcm_response(mp3_path: str, backend: str) -> dict:
         return _audio_payload(floats, SAMPLE_RATE, backend, peak=peak)
 
 
+def _coqui_speaker_name(speaker: str) -> str:
+    """VCTK models expect names like VCTK_p229, not bare p229."""
+    s = (speaker or "").strip()
+    if not s:
+        return s
+    if s.startswith("VCTK_"):
+        return s
+    if len(s) >= 2 and s[0] == "p" and s[1:].isdigit():
+        return f"VCTK_{s}"
+    return s
+
+
+def _resolve_coqui_speaker(engine, speaker: str) -> str:
+    sid = _coqui_speaker_name(speaker)
+    speakers = getattr(engine, "speakers", None) or []
+    if not speakers:
+        return sid
+    if sid in speakers:
+        return sid
+    for name in speakers:
+        if sid and (sid in name or name.endswith(sid.replace("VCTK_", ""))):
+            return name
+    return sid
+
+
+def _activate_edge_fallback(reason: str) -> bool:
+    global TTS_ENGINE, ACTIVE_BACKEND, TTS_STARTUP_HINT
+    if not HAS_EDGE:
+        return False
+    print(f"Using edge-tts ({EDGE_VOICE}): {reason}")
+    ACTIVE_BACKEND = "edge"
+    TTS_ENGINE = "edge"
+    TTS_STARTUP_HINT = reason
+    return True
+
+
 def _synthesize_coqui(text: str) -> dict:
-    if not TTS_ENGINE:
+    if not TTS_ENGINE or TTS_ENGINE == "edge":
         raise RuntimeError("Coqui TTS not loaded")
-    wav = TTS_ENGINE.tts(text=text)
+    kwargs = {"text": text}
+    if TTS_SPEAKER and "vctk" in MODEL_NAME.lower():
+        kwargs["speaker"] = _resolve_coqui_speaker(TTS_ENGINE, TTS_SPEAKER)
+    try:
+        wav = TTS_ENGINE.tts(**kwargs)
+    except Exception as coqui_err:
+        print(f"Coqui synth failed: {coqui_err}")
+        if _activate_edge_fallback(f"Coqui synth failed; edge-tts ({EDGE_VOICE})."):
+            return _synthesize_edge(text)
+        raise
     backend = "coqui-gpu" if USE_GPU and _cuda_available() else "coqui-cpu"
     return _audio_payload(np.asarray(wav, dtype=np.float32), SAMPLE_RATE, backend)
 
@@ -228,23 +275,19 @@ async def lifespan(app: FastAPI):
     backend = _pick_backend()
     if backend == "coqui":
         try:
-            print(f"Loading Coqui TTS {MODEL_NAME} gpu={USE_GPU}")
+            sp = f" speaker={TTS_SPEAKER}" if TTS_SPEAKER and "vctk" in MODEL_NAME.lower() else ""
+            print(f"Loading Coqui TTS {MODEL_NAME}{sp} gpu={USE_GPU}")
             TTS_ENGINE = TTS(model_name=MODEL_NAME, progress_bar=False, gpu=USE_GPU)
             print("Coqui model loaded.")
             TTS_STARTUP_HINT = None
         except Exception as exc:
             print(f"Coqui load failed: {exc}")
-            if HAS_EDGE:
-                print("Falling back to edge-tts.")
-                ACTIVE_BACKEND = "edge"
-                TTS_ENGINE = "edge"
-                TTS_STARTUP_HINT = f"Coqui failed ({exc}); using edge-tts."
-            else:
+            if not _activate_edge_fallback(f"Coqui load failed ({exc}); edge-tts."):
                 ACTIVE_BACKEND = None
                 TTS_ENGINE = None
                 TTS_STARTUP_HINT = (
                     f"Coqui failed ({exc}) and edge-tts is not installed. "
-                    "Run: bash setup-kaggle.sh"
+                    "On Kaggle: pip install edge-tts  OR  bash setup-kaggle.sh"
                 )
     elif backend == "edge":
         print(f"Using edge-tts voice={EDGE_VOICE} (Python 3.12 / no Coqui).")
@@ -312,7 +355,9 @@ def health():
 @app.post("/synthesize")
 def synthesize(req: TextRequest):
     if not TTS_ENGINE:
-        raise HTTPException(status_code=503, detail="TTS not ready")
+        if not _activate_edge_fallback("Coqui was not ready; activating edge-tts on first request."):
+            hint = TTS_STARTUP_HINT or "TTS not ready"
+            raise HTTPException(status_code=503, detail=hint)
     text = (req.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text required")

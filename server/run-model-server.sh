@@ -9,10 +9,18 @@ if [ -z "$TTS_BACKEND" ] && [ -f .tts-backend ]; then
 fi
 TTS_BACKEND="${TTS_BACKEND:-auto}"
 
+# Optional: male Edge voice immediately (no Coqui download). Uncomment on Kaggle if /synthesize returns 503:
+# export TTS_BACKEND=edge
+
 if [ -f .use-venv ] && [ "$(cat .use-venv)" = "1" ] && [ -x .venv/bin/python ]; then
   # shellcheck disable=SC1091
   source .venv/bin/activate
+  if [ "$TTS_BACKEND" = "coqui" ] || [ "$TTS_BACKEND" = "auto" ]; then
+    .venv/bin/python -m pip install -q "edge-tts>=6.1.0" "gTTS>=2.5.0" 2>/dev/null || true
+  fi
   exec env TTS_BACKEND="$TTS_BACKEND" GPU="${GPU:-1}" USE_TALKING_AVATAR="${USE_TALKING_AVATAR:-0}" \
+    TTS_MODEL="${TTS_MODEL:-tts_models/en/vctk/vits}" TTS_SPEAKER="${TTS_SPEAKER:-p229}" \
+    EDGE_VOICE="${EDGE_VOICE:-en-US-GuyNeural}" \
     python modelServer.py
 fi
 
@@ -20,5 +28,10 @@ PY="python3"
 if [ -f .python-bin ]; then
   PY="$(cat .python-bin)"
 fi
+if [ "$TTS_BACKEND" = "coqui" ] || [ "$TTS_BACKEND" = "auto" ]; then
+  "$PY" -m pip install -q "edge-tts>=6.1.0" "gTTS>=2.5.0" 2>/dev/null || true
+fi
 exec env TTS_BACKEND="$TTS_BACKEND" GPU="${GPU:-1}" USE_TALKING_AVATAR="${USE_TALKING_AVATAR:-0}" \
+  TTS_MODEL="${TTS_MODEL:-tts_models/en/vctk/vits}" TTS_SPEAKER="${TTS_SPEAKER:-p229}" \
+  EDGE_VOICE="${EDGE_VOICE:-en-US-GuyNeural}" \
   "$PY" modelServer.py

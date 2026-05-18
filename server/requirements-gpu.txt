@@ -6,3 +6,6 @@ numpy==1.22.0
 TTS==0.22.0
 torch>=2.0.0,<2.3.0
 torchaudio>=2.0.0,<2.3.0
+# Male voice fallback when Coqui model load/synth fails (GuyNeural)
+edge-tts>=6.1.0
+gTTS>=2.5.0
