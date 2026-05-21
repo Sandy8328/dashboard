@@ -4,3 +4,5 @@ setuptools>=65.0.0,<82
 resemblyzer>=0.1.1
 librosa>=0.9,<0.11
 soundfile>=0.12
+# Passive speech gate (optional; falls back to passthrough if missing)
+silero-vad>=6.0.0

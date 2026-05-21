@@ -59,6 +59,13 @@ class VoiceIdentifyRequest(BaseModel):
     profiles: list = []
 
 
+class VoicePassiveRequest(BaseModel):
+    audio_base64: str
+    mime: str = "audio/webm"
+    profiles: list = []
+    transcript: str = ""
+
+
 def _cuda_available():
     try:
         import torch
@@ -405,6 +412,29 @@ def voice_identify(req: VoiceIdentifyRequest):
                 detail=st.get("error") or "Voice ID not ready. Run: bash setup-voice-id.sh",
             )
         return identify_from_base64(req.audio_base64, req.profiles or [], req.mime)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/voice/passive")
+def voice_passive(req: VoicePassiveRequest):
+    try:
+        from voice_id import passive_from_base64, status as voice_status
+
+        st = voice_status()
+        if not st.get("ready"):
+            raise HTTPException(
+                status_code=503,
+                detail=st.get("error") or "Voice ID not ready. Run: bash setup-voice-id.sh",
+            )
+        return passive_from_base64(
+            req.audio_base64,
+            req.profiles or [],
+            req.mime,
+            req.transcript or "",
+        )
     except HTTPException:
         raise
     except Exception as exc:

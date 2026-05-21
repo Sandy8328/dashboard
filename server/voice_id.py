@@ -20,6 +20,7 @@ MATCH_THRESHOLD = float(os.environ.get("VOICE_MATCH_THRESHOLD", "0.64"))
 WEAK_MATCH = float(os.environ.get("VOICE_WEAK_MATCH", "0.62"))
 MATCH_MARGIN = float(os.environ.get("VOICE_MATCH_MARGIN", "0.07"))
 MIN_ENROLL_SEC = float(os.environ.get("VOICE_MIN_ENROLL_SEC", "4"))
+PASSIVE_MIN_SEC = float(os.environ.get("VOICE_PASSIVE_MIN_SEC", "0.35"))
 
 
 def _lazy_init() -> bool:
@@ -44,12 +45,20 @@ def _lazy_init() -> bool:
 
 def status() -> dict:
     ok = _lazy_init()
+    vad = {"ready": False}
+    try:
+        from silero_vad import status as vad_status
+
+        vad = vad_status()
+    except Exception:
+        vad = {"ready": False}
     return {
         "ready": ok,
         "backend": "resemblyzer" if ok else None,
         "match_threshold": MATCH_THRESHOLD,
         "weak_match": WEAK_MATCH,
         "match_margin": MATCH_MARGIN,
+        "vad": vad,
         "error": None if ok else _INIT_ERROR,
     }
 
@@ -123,6 +132,56 @@ def embed_from_base64(audio_b64: str, mime: str = "audio/webm") -> dict[str, Any
         return {"embedding": embedding, "duration_ms": int(dur * 1000), "dims": len(embedding)}
 
 
+def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
+    if not profiles:
+        return {"matched": False, "reason": "no_profiles"}
+    probe = np.asarray(_embed_path(wav_path), dtype=np.float64)
+    ranked: list[tuple[float, dict]] = []
+    for p in profiles:
+        emb = p.get("embedding")
+        if not emb or len(emb) < 8:
+            continue
+        score = _cosine(probe, np.asarray(emb, dtype=np.float64))
+        ranked.append((score, p))
+    if not ranked:
+        return {
+            "matched": False,
+            "confidence": 0.0,
+            "threshold": MATCH_THRESHOLD,
+            "reason": "no_embeddings",
+        }
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    best_score, best = ranked[0]
+    second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+    margin = float(best_score - second_score)
+    conf = round(max(0.0, best_score), 3)
+    base = {
+        "confidence": conf,
+        "second_best": round(max(0.0, second_score), 3),
+        "margin": round(max(0.0, margin), 3),
+        "threshold": MATCH_THRESHOLD,
+        "weak_threshold": WEAK_MATCH,
+        "match_margin_min": MATCH_MARGIN,
+    }
+    matched = False
+    match_mode = None
+    if best_score >= MATCH_THRESHOLD:
+        matched = True
+        match_mode = "threshold"
+    elif best_score >= WEAK_MATCH and margin >= MATCH_MARGIN:
+        matched = True
+        match_mode = "weak_margin"
+    if matched and best is not None:
+        return {
+            **base,
+            "matched": True,
+            "id": best.get("id"),
+            "name": best.get("name"),
+            "match_mode": match_mode,
+        }
+    return {**base, "matched": False, "reason": "no_match"}
+
+
 def identify_from_base64(
     audio_b64: str, profiles: list[dict], mime: str = "audio/webm"
 ) -> dict[str, Any]:
@@ -133,51 +192,66 @@ def identify_from_base64(
         wav = os.path.join(tmp, "probe.wav")
         _write_b64(src, audio_b64)
         _to_wav_16k(src, wav)
-        probe = np.asarray(_embed_path(wav), dtype=np.float64)
-        ranked: list[tuple[float, dict]] = []
-        for p in profiles:
-            emb = p.get("embedding")
-            if not emb or len(emb) < 8:
-                continue
-            score = _cosine(probe, np.asarray(emb, dtype=np.float64))
-            ranked.append((score, p))
-        if not ranked:
+        return _identify_wav_path(wav, profiles)
+
+
+def passive_from_base64(
+    audio_b64: str,
+    profiles: list[dict],
+    mime: str = "audio/webm",
+    transcript: str = "",
+) -> dict[str, Any]:
+    """VAD gate + speaker ID for passive logging (no LLM)."""
+    if not audio_b64:
+        return {"matched": False, "reason": "no_audio", "speech_detected": False}
+    try:
+        from silero_vad import analyze_wav_16k
+    except Exception:
+        analyze_wav_16k = None  # type: ignore
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "passive.webm")
+        wav = os.path.join(tmp, "passive.wav")
+        _write_b64(src, audio_b64)
+        _to_wav_16k(src, wav)
+        dur = _wav_duration_sec(wav)
+        vad_info = (
+            analyze_wav_16k(wav)
+            if analyze_wav_16k
+            else {"speech_detected": True, "vad_backend": "passthrough"}
+        )
+        if not vad_info.get("speech_detected"):
             return {
                 "matched": False,
-                "confidence": 0.0,
-                "threshold": MATCH_THRESHOLD,
-                "reason": "no_embeddings",
+                "reason": "no_speech",
+                "speech_detected": False,
+                "vad": vad_info,
+                "transcript": (transcript or "").strip(),
             }
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        best_score, best = ranked[0]
-        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
-        margin = float(best_score - second_score)
-        conf = round(max(0.0, best_score), 3)
-        base = {
-            "confidence": conf,
-            "second_best": round(max(0.0, second_score), 3),
-            "margin": round(max(0.0, margin), 3),
-            "threshold": MATCH_THRESHOLD,
-            "weak_threshold": WEAK_MATCH,
-            "match_margin_min": MATCH_MARGIN,
-        }
-        matched = False
-        match_mode = None
-        if best_score >= MATCH_THRESHOLD:
-            matched = True
-            match_mode = "threshold"
-        elif best_score >= WEAK_MATCH and margin >= MATCH_MARGIN:
-            matched = True
-            match_mode = "weak_margin"
-        if matched and best is not None:
+        if dur < PASSIVE_MIN_SEC:
             return {
-                **base,
-                "matched": True,
-                "id": best.get("id"),
-                "name": best.get("name"),
-                "match_mode": match_mode,
+                "matched": False,
+                "reason": "audio_too_short",
+                "speech_detected": True,
+                "vad": vad_info,
+                "duration_ms": int(dur * 1000),
+                "transcript": (transcript or "").strip(),
             }
-        return {**base, "matched": False, "reason": "no_match"}
+        if not profiles:
+            return {
+                "matched": False,
+                "reason": "no_profiles",
+                "speech_detected": True,
+                "vad": vad_info,
+                "transcript": (transcript or "").strip(),
+            }
+        out = _identify_wav_path(wav, profiles)
+        out["speech_detected"] = True
+        out["vad"] = vad_info
+        out["duration_ms"] = int(dur * 1000)
+        out["transcript"] = (transcript or "").strip()
+        out["passive"] = True
+        return out
 
 
 def _wav_duration_sec(path: str) -> float:

@@ -36,6 +36,7 @@ app.get("/", (_req, res) => {
       "POST /api/assistant",
       "POST /api/voice/enroll",
       "POST /api/voice/identify",
+      "POST /api/voice/passive",
     ],
   });
 });
@@ -91,6 +92,18 @@ app.post("/api/voice/identify", async (req, res) => {
   } catch (err) {
     console.error("voice identify error:", err.message);
     res.status(502).json({ error: "Voice identify failed", detail: err.message });
+  }
+});
+
+app.post("/api/voice/passive", async (req, res) => {
+  if (!useGPU) {
+    return res.status(503).json({ error: "GPU not enabled. Start with USE_GPU_MODEL=1" });
+  }
+  try {
+    res.json(await proxyToGPU("/voice/passive", req.body || {}));
+  } catch (err) {
+    console.error("voice passive error:", err.message);
+    res.status(502).json({ error: "Voice passive failed", detail: err.message });
   }
 });
 
