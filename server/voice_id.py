@@ -19,9 +19,19 @@ _INIT_ERROR = None
 MATCH_THRESHOLD = float(os.environ.get("VOICE_MATCH_THRESHOLD", "0.64"))
 WEAK_MATCH = float(os.environ.get("VOICE_WEAK_MATCH", "0.62"))
 MATCH_MARGIN = float(os.environ.get("VOICE_MATCH_MARGIN", "0.07"))
+MULTI_MATCH_THRESHOLD = float(os.environ.get("VOICE_MULTI_MATCH_THRESHOLD", "0.70"))
+MULTI_WEAK_MATCH = float(os.environ.get("VOICE_MULTI_WEAK_MATCH", "0.65"))
+MULTI_MATCH_MARGIN = float(os.environ.get("VOICE_MULTI_MATCH_MARGIN", "0.10"))
 MIN_ENROLL_SEC = float(os.environ.get("VOICE_MIN_ENROLL_SEC", "4"))
 PASSIVE_MIN_SEC = float(os.environ.get("VOICE_PASSIVE_MIN_SEC", "0.35"))
 
+
+def _thresholds_for_profiles(num_profiles: int) -> tuple[float, float, float]:
+    """Stricter matching when 2+ enrolled voices (reduces Sandy/Tharun swaps)."""
+    if num_profiles >= 2:
+        return MULTI_MATCH_THRESHOLD, MULTI_WEAK_MATCH, MULTI_MATCH_MARGIN
+    return MATCH_THRESHOLD, WEAK_MATCH, MATCH_MARGIN
+ 
 
 def _lazy_init() -> bool:
     global _RESEMBLYZER, _ENCODER, _READY, _INIT_ERROR
@@ -47,7 +57,7 @@ def status() -> dict:
     ok = _lazy_init()
     vad = {"ready": False}
     try:
-        from silero_vad import status as vad_status
+        from vad_gate import status as vad_status
 
         vad = vad_status()
     except Exception:
@@ -153,22 +163,26 @@ def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
     ranked.sort(key=lambda x: x[0], reverse=True)
     best_score, best = ranked[0]
     second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+    second_profile = ranked[1][1] if len(ranked) > 1 else None
     margin = float(best_score - second_score)
     conf = round(max(0.0, best_score), 3)
+    th, weak, margin_min = _thresholds_for_profiles(len(profiles))
     base = {
         "confidence": conf,
         "second_best": round(max(0.0, second_score), 3),
+        "second_best_name": (second_profile or {}).get("name"),
         "margin": round(max(0.0, margin), 3),
-        "threshold": MATCH_THRESHOLD,
-        "weak_threshold": WEAK_MATCH,
-        "match_margin_min": MATCH_MARGIN,
+        "threshold": th,
+        "weak_threshold": weak,
+        "match_margin_min": margin_min,
+        "profile_count": len(profiles),
     }
     matched = False
     match_mode = None
-    if best_score >= MATCH_THRESHOLD:
+    if best_score >= th:
         matched = True
         match_mode = "threshold"
-    elif best_score >= WEAK_MATCH and margin >= MATCH_MARGIN:
+    elif best_score >= weak and margin >= margin_min:
         matched = True
         match_mode = "weak_margin"
     if matched and best is not None:
@@ -205,7 +219,7 @@ def passive_from_base64(
     if not audio_b64:
         return {"matched": False, "reason": "no_audio", "speech_detected": False}
     try:
-        from silero_vad import analyze_wav_16k
+        from vad_gate import analyze_wav_16k
     except Exception:
         analyze_wav_16k = None  # type: ignore
 

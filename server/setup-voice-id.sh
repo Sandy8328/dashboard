@@ -36,7 +36,10 @@ st = status()
 print(json.dumps(st, indent=2))
 if not st.get('ready'):
     sys.exit(1)
+vad = st.get('vad') or {}
+if not vad.get('ready'):
+    print('WARN: Silero VAD not ready — passive gate uses passthrough.', vad.get('error'), file=sys.stderr)
 "
 
 echo ""
-echo "Voice ID ready. modelServer.py exposes POST /voice/enroll and /voice/identify"
+echo "Voice ID ready. modelServer.py exposes POST /voice/enroll, /voice/identify, /voice/passive (Silero VAD gate)"

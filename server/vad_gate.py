@@ -1,5 +1,6 @@
 """
 Silero VAD gate for passive speaker logging (optional — falls back if import fails).
+Uses the pip package `silero-vad` — do NOT name this file silero_vad.py (shadows the package).
 https://github.com/snakers4/silero-vad
 """
 from __future__ import annotations
