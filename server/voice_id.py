@@ -16,7 +16,9 @@ _ENCODER = None
 _READY = False
 _INIT_ERROR = None
 
-MATCH_THRESHOLD = float(os.environ.get("VOICE_MATCH_THRESHOLD", "0.75"))
+MATCH_THRESHOLD = float(os.environ.get("VOICE_MATCH_THRESHOLD", "0.64"))
+WEAK_MATCH = float(os.environ.get("VOICE_WEAK_MATCH", "0.62"))
+MATCH_MARGIN = float(os.environ.get("VOICE_MATCH_MARGIN", "0.07"))
 MIN_ENROLL_SEC = float(os.environ.get("VOICE_MIN_ENROLL_SEC", "4"))
 
 
@@ -46,6 +48,8 @@ def status() -> dict:
         "ready": ok,
         "backend": "resemblyzer" if ok else None,
         "match_threshold": MATCH_THRESHOLD,
+        "weak_match": WEAK_MATCH,
+        "match_margin": MATCH_MARGIN,
         "error": None if ok else _INIT_ERROR,
     }
 
@@ -130,29 +134,50 @@ def identify_from_base64(
         _write_b64(src, audio_b64)
         _to_wav_16k(src, wav)
         probe = np.asarray(_embed_path(wav), dtype=np.float64)
-        best = None
-        best_score = -1.0
+        ranked: list[tuple[float, dict]] = []
         for p in profiles:
             emb = p.get("embedding")
             if not emb or len(emb) < 8:
                 continue
             score = _cosine(probe, np.asarray(emb, dtype=np.float64))
-            if score > best_score:
-                best_score = score
-                best = p
-        if best is None or best_score < MATCH_THRESHOLD:
+            ranked.append((score, p))
+        if not ranked:
             return {
                 "matched": False,
-                "confidence": round(max(0.0, best_score), 3),
+                "confidence": 0.0,
                 "threshold": MATCH_THRESHOLD,
+                "reason": "no_embeddings",
             }
-        return {
-            "matched": True,
-            "id": best.get("id"),
-            "name": best.get("name"),
-            "confidence": round(best_score, 3),
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        best_score, best = ranked[0]
+        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+        margin = float(best_score - second_score)
+        conf = round(max(0.0, best_score), 3)
+        base = {
+            "confidence": conf,
+            "second_best": round(max(0.0, second_score), 3),
+            "margin": round(max(0.0, margin), 3),
             "threshold": MATCH_THRESHOLD,
+            "weak_threshold": WEAK_MATCH,
+            "match_margin_min": MATCH_MARGIN,
         }
+        matched = False
+        match_mode = None
+        if best_score >= MATCH_THRESHOLD:
+            matched = True
+            match_mode = "threshold"
+        elif best_score >= WEAK_MATCH and margin >= MATCH_MARGIN:
+            matched = True
+            match_mode = "weak_margin"
+        if matched and best is not None:
+            return {
+                **base,
+                "matched": True,
+                "id": best.get("id"),
+                "name": best.get("name"),
+                "match_mode": match_mode,
+            }
+        return {**base, "matched": False, "reason": "no_match"}
 
 
 def _wav_duration_sec(path: str) -> float:

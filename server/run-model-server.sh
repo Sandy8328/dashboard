@@ -21,6 +21,9 @@ if [ -f .use-venv ] && [ "$(cat .use-venv)" = "1" ] && [ -x .venv/bin/python ]; 
   exec env TTS_BACKEND="$TTS_BACKEND" GPU="${GPU:-1}" USE_TALKING_AVATAR="${USE_TALKING_AVATAR:-0}" \
     TTS_MODEL="${TTS_MODEL:-tts_models/en/vctk/vits}" TTS_SPEAKER="${TTS_SPEAKER:-p229}" \
     EDGE_VOICE="${EDGE_VOICE:-en-US-GuyNeural}" \
+    VOICE_MATCH_THRESHOLD="${VOICE_MATCH_THRESHOLD:-0.64}" \
+    VOICE_WEAK_MATCH="${VOICE_WEAK_MATCH:-0.62}" \
+    VOICE_MATCH_MARGIN="${VOICE_MATCH_MARGIN:-0.07}" \
     python modelServer.py
 fi
 
@@ -34,4 +37,7 @@ fi
 exec env TTS_BACKEND="$TTS_BACKEND" GPU="${GPU:-1}" USE_TALKING_AVATAR="${USE_TALKING_AVATAR:-0}" \
   TTS_MODEL="${TTS_MODEL:-tts_models/en/vctk/vits}" TTS_SPEAKER="${TTS_SPEAKER:-p229}" \
   EDGE_VOICE="${EDGE_VOICE:-en-US-GuyNeural}" \
+  VOICE_MATCH_THRESHOLD="${VOICE_MATCH_THRESHOLD:-0.64}" \
+  VOICE_WEAK_MATCH="${VOICE_WEAK_MATCH:-0.62}" \
+  VOICE_MATCH_MARGIN="${VOICE_MATCH_MARGIN:-0.07}" \
   "$PY" modelServer.py
