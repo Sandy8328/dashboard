@@ -19,9 +19,9 @@ _INIT_ERROR = None
 MATCH_THRESHOLD = float(os.environ.get("VOICE_MATCH_THRESHOLD", "0.64"))
 WEAK_MATCH = float(os.environ.get("VOICE_WEAK_MATCH", "0.62"))
 MATCH_MARGIN = float(os.environ.get("VOICE_MATCH_MARGIN", "0.07"))
-MULTI_MATCH_THRESHOLD = float(os.environ.get("VOICE_MULTI_MATCH_THRESHOLD", "0.70"))
-MULTI_WEAK_MATCH = float(os.environ.get("VOICE_MULTI_WEAK_MATCH", "0.65"))
-MULTI_MATCH_MARGIN = float(os.environ.get("VOICE_MULTI_MATCH_MARGIN", "0.10"))
+MULTI_MATCH_THRESHOLD = float(os.environ.get("VOICE_MULTI_MATCH_THRESHOLD", "0.60"))
+MULTI_WEAK_MATCH = float(os.environ.get("VOICE_MULTI_WEAK_MATCH", "0.56"))
+MULTI_MATCH_MARGIN = float(os.environ.get("VOICE_MULTI_MATCH_MARGIN", "0.08"))
 MIN_ENROLL_SEC = float(os.environ.get("VOICE_MIN_ENROLL_SEC", "4"))
 PASSIVE_MIN_SEC = float(os.environ.get("VOICE_PASSIVE_MIN_SEC", "0.35"))
 
