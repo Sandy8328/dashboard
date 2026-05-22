@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Optional speaker enrollment (Resemblyzer) on Kaggle — run after setup-kaggle.sh
+# Speaker enrollment (SpeechBrain ECAPA) on Kaggle — run after setup-kaggle.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,16 +19,21 @@ RUN() {
   fi
 }
 
-echo "==> setuptools <82 (pkg_resources for Resemblyzer; removed in 82+)"
-PIP install -U "setuptools>=65.0.0,<82" wheel
+export VOICE_BACKEND="${VOICE_BACKEND:-ecapa}"
 
-echo "==> Resemblyzer + deps"
+echo "==> SpeechBrain ECAPA voice ID (VOICE_BACKEND=$VOICE_BACKEND)"
 PIP install -r requirements-voice-id.txt
+
+if [ "$VOICE_BACKEND" = "resemblyzer" ]; then
+  echo "==> Legacy Resemblyzer extras"
+  PIP install -U "setuptools>=65.0.0,<82" wheel
+  PIP install "resemblyzer>=0.1.1" "librosa>=0.9,<0.11"
+fi
 
 echo "==> Verify ffmpeg"
 ffmpeg -version | head -n 1
 
-echo "==> Verify VoiceEncoder"
+echo "==> Verify voice encoder (first run may download ECAPA weights)"
 RUN -c "
 from voice_id import status
 import json, sys
@@ -42,4 +47,5 @@ if not vad.get('ready'):
 "
 
 echo ""
-echo "Voice ID ready. modelServer.py exposes POST /voice/enroll, /voice/identify, /voice/passive (Silero VAD gate)"
+echo "Voice ID ready (SpeechBrain ECAPA). Re-enroll all officials on Mac after upgrade."
+echo "Endpoints: POST /voice/enroll, /voice/identify, /voice/passive"

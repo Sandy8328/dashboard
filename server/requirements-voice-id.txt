@@ -1,8 +1,13 @@
-# Speaker ID (optional) — install after Coqui venv: pip install -r requirements-voice-id.txt
-# Resemblyzer imports pkg_resources (removed in setuptools 82+).
-setuptools>=65.0.0,<82
-resemblyzer>=0.1.1
-librosa>=0.9,<0.11
-soundfile>=0.12
-# Passive speech gate (optional; falls back to passthrough if missing)
+# Speaker ID — SpeechBrain ECAPA (default). Optional legacy: VOICE_BACKEND=resemblyzer
+speechbrain>=1.0.0
+torch>=2.0.0
+torchaudio>=2.1.0
+huggingface_hub>=0.20.0
+hyperpyyaml>=1.2.0
+soundfile>=0.12.0
+# Passive speech gate (optional; passthrough if missing)
 silero-vad>=6.0.0
+# Legacy backend only (pip if VOICE_BACKEND=resemblyzer):
+# setuptools>=65.0.0,<82
+# resemblyzer>=0.1.1
+# librosa>=0.9,<0.11

@@ -1,5 +1,7 @@
 """
-Speaker embedding (Resemblyzer) — stateless: browser stores profiles, GPU computes vectors.
+Speaker embedding — stateless: browser stores profiles, GPU computes vectors.
+Default backend: SpeechBrain ECAPA-TDNN (spkrec-ecapa-voxceleb).
+Optional: VOICE_BACKEND=resemblyzer for legacy Resemblyzer.
 """
 from __future__ import annotations
 
@@ -11,46 +13,101 @@ from typing import Any
 
 import numpy as np
 
-_RESEMBLYZER = None
+VOICE_BACKEND = os.environ.get("VOICE_BACKEND", "ecapa").strip().lower()
+ECAPA_MODEL = os.environ.get(
+    "VOICE_ECAPA_MODEL", "speechbrain/spkrec-ecapa-voxceleb"
+)
+ECAPA_SAVEDIR = os.environ.get(
+    "VOICE_ECAPA_SAVEDIR",
+    os.path.join(os.path.dirname(__file__), "pretrained_models", "spkrec-ecapa-voxceleb"),
+)
+
+BACKEND_ID = (
+    "speechbrain-ecapa-voxceleb"
+    if VOICE_BACKEND in ("ecapa", "speechbrain", "ecapa-tdnn")
+    else "resemblyzer"
+)
+
+if BACKEND_ID.startswith("speechbrain"):
+    _DEF_MATCH = 0.70
+    _DEF_WEAK = 0.65
+    _DEF_MARGIN = 0.05
+    _DEF_MULTI_MATCH = 0.68
+    _DEF_MULTI_WEAK = 0.63
+    _DEF_MULTI_MARGIN = 0.06
+else:
+    _DEF_MATCH = 0.64
+    _DEF_WEAK = 0.62
+    _DEF_MARGIN = 0.07
+    _DEF_MULTI_MATCH = 0.60
+    _DEF_MULTI_WEAK = 0.56
+    _DEF_MULTI_MARGIN = 0.08
+
+MATCH_THRESHOLD = float(os.environ.get("VOICE_MATCH_THRESHOLD", str(_DEF_MATCH)))
+WEAK_MATCH = float(os.environ.get("VOICE_WEAK_MATCH", str(_DEF_WEAK)))
+MATCH_MARGIN = float(os.environ.get("VOICE_MATCH_MARGIN", str(_DEF_MARGIN)))
+MULTI_MATCH_THRESHOLD = float(
+    os.environ.get("VOICE_MULTI_MATCH_THRESHOLD", str(_DEF_MULTI_MATCH))
+)
+MULTI_WEAK_MATCH = float(os.environ.get("VOICE_MULTI_WEAK_MATCH", str(_DEF_MULTI_WEAK)))
+MULTI_MATCH_MARGIN = float(
+    os.environ.get("VOICE_MULTI_MATCH_MARGIN", str(_DEF_MULTI_MARGIN))
+)
+MIN_ENROLL_SEC = float(os.environ.get("VOICE_MIN_ENROLL_SEC", "4"))
+PASSIVE_MIN_SEC = float(os.environ.get("VOICE_PASSIVE_MIN_SEC", "0.35"))
+
 _ENCODER = None
 _READY = False
 _INIT_ERROR = None
 
-MATCH_THRESHOLD = float(os.environ.get("VOICE_MATCH_THRESHOLD", "0.64"))
-WEAK_MATCH = float(os.environ.get("VOICE_WEAK_MATCH", "0.62"))
-MATCH_MARGIN = float(os.environ.get("VOICE_MATCH_MARGIN", "0.07"))
-MULTI_MATCH_THRESHOLD = float(os.environ.get("VOICE_MULTI_MATCH_THRESHOLD", "0.60"))
-MULTI_WEAK_MATCH = float(os.environ.get("VOICE_MULTI_WEAK_MATCH", "0.56"))
-MULTI_MATCH_MARGIN = float(os.environ.get("VOICE_MULTI_MATCH_MARGIN", "0.08"))
-MIN_ENROLL_SEC = float(os.environ.get("VOICE_MIN_ENROLL_SEC", "4"))
-PASSIVE_MIN_SEC = float(os.environ.get("VOICE_PASSIVE_MIN_SEC", "0.35"))
-
 
 def _thresholds_for_profiles(num_profiles: int) -> tuple[float, float, float]:
-    """Stricter matching when 2+ enrolled voices (reduces Sandy/Tharun swaps)."""
     if num_profiles >= 2:
         return MULTI_MATCH_THRESHOLD, MULTI_WEAK_MATCH, MULTI_MATCH_MARGIN
     return MATCH_THRESHOLD, WEAK_MATCH, MATCH_MARGIN
- 
+
 
 def _lazy_init() -> bool:
-    global _RESEMBLYZER, _ENCODER, _READY, _INIT_ERROR
+    global _ENCODER, _READY, _INIT_ERROR
     if _READY:
         return True
     if _INIT_ERROR:
         return False
     try:
-        from resemblyzer import VoiceEncoder, preprocess_wav
-
-        _RESEMBLYZER = {"VoiceEncoder": VoiceEncoder, "preprocess_wav": preprocess_wav}
-        _ENCODER = VoiceEncoder()
+        if BACKEND_ID.startswith("speechbrain"):
+            _ENCODER = _load_ecapa_encoder()
+        else:
+            _ENCODER = _load_resemblyzer_encoder()
         _READY = True
-        print("VoiceEncoder loaded for speaker ID.")
+        print(f"Voice ID ready: {BACKEND_ID}")
         return True
     except Exception as exc:
         _INIT_ERROR = str(exc)
-        print("VoiceEncoder not available:", exc)
+        print(f"Voice ID init failed ({BACKEND_ID}):", exc)
         return False
+
+
+def _load_ecapa_encoder() -> Any:
+    import torch
+    from speechbrain.inference.speaker import EncoderClassifier
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading SpeechBrain ECAPA ({ECAPA_MODEL}) on {device}...")
+    classifier = EncoderClassifier.from_hparams(
+        source=ECAPA_MODEL,
+        savedir=ECAPA_SAVEDIR,
+        run_opts={"device": device},
+    )
+    if hasattr(classifier, "eval"):
+        classifier.eval()
+    return {"kind": "ecapa", "model": classifier, "device": device}
+
+
+def _load_resemblyzer_encoder() -> Any:
+    from resemblyzer import VoiceEncoder, preprocess_wav
+
+    enc = VoiceEncoder()
+    return {"kind": "resemblyzer", "encoder": enc, "preprocess_wav": preprocess_wav}
 
 
 def status() -> dict:
@@ -64,12 +121,20 @@ def status() -> dict:
         vad = {"ready": False}
     return {
         "ready": ok,
-        "backend": "resemblyzer" if ok else None,
+        "backend": BACKEND_ID if ok else None,
+        "voice_backend": VOICE_BACKEND,
+        "ecapa_model": ECAPA_MODEL if BACKEND_ID.startswith("speechbrain") else None,
         "match_threshold": MATCH_THRESHOLD,
         "weak_match": WEAK_MATCH,
         "match_margin": MATCH_MARGIN,
+        "multi_match_threshold": MULTI_MATCH_THRESHOLD,
         "vad": vad,
         "error": None if ok else _INIT_ERROR,
+        "re_enroll_required": (
+            "Old Resemblyzer profiles must be re-enrolled after switching to ECAPA."
+            if BACKEND_ID.startswith("speechbrain")
+            else None
+        ),
     }
 
 
@@ -103,27 +168,52 @@ def _to_wav_16k(src_path: str, dst_path: str) -> None:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr or proc.stdout}")
 
 
-def _load_wav(path: str) -> np.ndarray:
-    if not _lazy_init():
-        raise RuntimeError(_INIT_ERROR or "VoiceEncoder not ready")
-    preprocess_wav = _RESEMBLYZER["preprocess_wav"]
-    return preprocess_wav(path)
-
-
 def _embed_path(wav_path: str) -> list[float]:
-    wav = _load_wav(wav_path)
-    emb = _ENCODER.embed_utterance(wav)
-    return [float(x) for x in np.asarray(emb).flatten()]
+    if not _lazy_init():
+        raise RuntimeError(_INIT_ERROR or "Voice encoder not ready")
+    if _ENCODER["kind"] == "ecapa":
+        emb = _ENCODER["model"].encode_file(wav_path)
+        if hasattr(emb, "detach"):
+            vec = emb.detach().cpu().numpy()
+        else:
+            vec = np.asarray(emb)
+        vec = np.asarray(vec).squeeze().astype(np.float64)
+    else:
+        wav = _ENCODER["preprocess_wav"](wav_path)
+        vec = np.asarray(_ENCODER["encoder"].embed_utterance(wav)).flatten().astype(
+            np.float64
+        )
+    norm = np.linalg.norm(vec)
+    if norm > 1e-9:
+        vec = vec / norm
+    return [float(x) for x in vec]
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype=np.float64).flatten()
     b = np.asarray(b, dtype=np.float64).flatten()
+    if a.shape != b.shape:
+        return 0.0
     na = np.linalg.norm(a)
     nb = np.linalg.norm(b)
     if na < 1e-9 or nb < 1e-9:
         return 0.0
     return float(np.dot(a, b) / (na * nb))
+
+
+def _compatible_profiles(profiles: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for p in profiles:
+        pb = (p.get("embedding_backend") or p.get("embeddingBackend") or "").strip()
+        if not pb:
+            # Legacy Resemblyzer profiles — skip when using ECAPA
+            if BACKEND_ID.startswith("speechbrain"):
+                continue
+            out.append(p)
+            continue
+        if pb == BACKEND_ID:
+            out.append(p)
+    return out
 
 
 def embed_from_base64(audio_b64: str, mime: str = "audio/webm") -> dict[str, Any]:
@@ -137,17 +227,34 @@ def embed_from_base64(audio_b64: str, mime: str = "audio/webm") -> dict[str, Any
         _to_wav_16k(src, wav)
         dur = _wav_duration_sec(wav)
         if dur < MIN_ENROLL_SEC:
-            raise ValueError(f"audio too short ({dur:.1f}s); speak at least {MIN_ENROLL_SEC:.0f}s")
+            raise ValueError(
+                f"audio too short ({dur:.1f}s); speak at least {MIN_ENROLL_SEC:.0f}s"
+            )
         embedding = _embed_path(wav)
-        return {"embedding": embedding, "duration_ms": int(dur * 1000), "dims": len(embedding)}
+        return {
+            "embedding": embedding,
+            "duration_ms": int(dur * 1000),
+            "dims": len(embedding),
+            "embedding_backend": BACKEND_ID,
+        }
 
 
 def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
+    compatible = _compatible_profiles(profiles)
     if not profiles:
-        return {"matched": False, "reason": "no_profiles"}
+        return {"matched": False, "reason": "no_profiles", "embedding_backend": BACKEND_ID}
+    if not compatible:
+        return {
+            "matched": False,
+            "reason": "stale_embeddings",
+            "embedding_backend": BACKEND_ID,
+            "profile_count": len(profiles),
+            "compatible_count": 0,
+            "hint": "Re-enroll all voices after SpeechBrain upgrade (clear profiles, register again).",
+        }
     probe = np.asarray(_embed_path(wav_path), dtype=np.float64)
     ranked: list[tuple[float, dict]] = []
-    for p in profiles:
+    for p in compatible:
         emb = p.get("embedding")
         if not emb or len(emb) < 8:
             continue
@@ -159,6 +266,7 @@ def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
             "confidence": 0.0,
             "threshold": MATCH_THRESHOLD,
             "reason": "no_embeddings",
+            "embedding_backend": BACKEND_ID,
         }
     ranked.sort(key=lambda x: x[0], reverse=True)
     best_score, best = ranked[0]
@@ -166,7 +274,7 @@ def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
     second_profile = ranked[1][1] if len(ranked) > 1 else None
     margin = float(best_score - second_score)
     conf = round(max(0.0, best_score), 3)
-    th, weak, margin_min = _thresholds_for_profiles(len(profiles))
+    th, weak, margin_min = _thresholds_for_profiles(len(compatible))
     base = {
         "confidence": conf,
         "second_best": round(max(0.0, second_score), 3),
@@ -176,6 +284,8 @@ def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
         "weak_threshold": weak,
         "match_margin_min": margin_min,
         "profile_count": len(profiles),
+        "compatible_count": len(compatible),
+        "embedding_backend": BACKEND_ID,
     }
     matched = False
     match_mode = None
@@ -200,7 +310,7 @@ def identify_from_base64(
     audio_b64: str, profiles: list[dict], mime: str = "audio/webm"
 ) -> dict[str, Any]:
     if not profiles:
-        return {"matched": False, "reason": "no_profiles"}
+        return {"matched": False, "reason": "no_profiles", "embedding_backend": BACKEND_ID}
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "probe.webm")
         wav = os.path.join(tmp, "probe.wav")
@@ -215,7 +325,6 @@ def passive_from_base64(
     mime: str = "audio/webm",
     transcript: str = "",
 ) -> dict[str, Any]:
-    """VAD gate + speaker ID for passive logging (no LLM)."""
     if not audio_b64:
         return {"matched": False, "reason": "no_audio", "speech_detected": False}
     try:
