@@ -61,6 +61,58 @@ _READY = False
 _INIT_ERROR = None
 
 
+def _patch_torch_amp_compat() -> None:
+    """
+    SpeechBrain 1.x uses torch.amp.custom_fwd (PyTorch>=2.4).
+    Coqui Kaggle venv often has torch 2.0–2.2 — map to torch.cuda.amp.
+    """
+    try:
+        import torch
+    except Exception:
+        return
+    amp = getattr(torch, "amp", None)
+    if amp is None:
+        return
+    if hasattr(amp, "custom_fwd") and hasattr(amp, "custom_bwd"):
+        return
+    cuda_amp = getattr(torch.cuda, "amp", None)
+    if cuda_amp is None or not hasattr(cuda_amp, "custom_fwd"):
+        return
+
+    def _wrap(cuda_dec: Any) -> Any:
+        def compat_dec(*args: Any, **kwargs: Any) -> Any:
+            kwargs.pop("device_type", None)
+            if args and callable(args[0]):
+                return cuda_dec(**kwargs)(args[0])
+            return lambda fn: cuda_dec(**kwargs)(fn)
+
+        return compat_dec
+
+    if not hasattr(amp, "custom_fwd"):
+        amp.custom_fwd = _wrap(cuda_amp.custom_fwd)  # type: ignore[attr-defined]
+    if not hasattr(amp, "custom_bwd"):
+        amp.custom_bwd = _wrap(cuda_amp.custom_bwd)  # type: ignore[attr-defined]
+    print(
+        "[voice_id] Patched torch.amp.custom_fwd/bwd for SpeechBrain "
+        f"(torch {getattr(torch, '__version__', '?')})."
+    )
+
+
+def _patch_torchaudio_compat() -> None:
+    """SpeechBrain 1.x may call torchaudio.list_audio_backends (removed in torchaudio 2.9+)."""
+    try:
+        import torchaudio
+    except Exception:
+        return
+    if not hasattr(torchaudio, "list_audio_backends"):
+        torchaudio.list_audio_backends = lambda: ["soundfile"]  # type: ignore[attr-defined]
+
+
+if BACKEND_ID.startswith("speechbrain"):
+    _patch_torch_amp_compat()
+    _patch_torchaudio_compat()
+
+
 def _thresholds_for_profiles(num_profiles: int) -> tuple[float, float, float]:
     if num_profiles >= 2:
         return MULTI_MATCH_THRESHOLD, MULTI_WEAK_MATCH, MULTI_MATCH_MARGIN
@@ -88,6 +140,8 @@ def _lazy_init() -> bool:
 
 
 def _load_ecapa_encoder() -> Any:
+    _patch_torch_amp_compat()
+    _patch_torchaudio_compat()
     import torch
     from speechbrain.inference.speaker import EncoderClassifier
 
@@ -168,16 +222,74 @@ def _to_wav_16k(src_path: str, dst_path: str) -> None:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr or proc.stdout}")
 
 
+def _load_wav_tensor_16k_mono(wav_path: str, classifier: Any) -> Any:
+    """Load 16 kHz mono waveform as [batch=1, time] for encode_batch."""
+    import torch
+
+    signal = None
+    fs = 16000
+    if hasattr(classifier, "load_audio"):
+        try:
+            loaded = classifier.load_audio(wav_path)
+            if isinstance(loaded, tuple):
+                signal, fs = loaded[0], int(loaded[1]) if len(loaded) > 1 else 16000
+            else:
+                signal = loaded
+        except Exception:
+            signal = None
+
+    if signal is None:
+        try:
+            import torchaudio
+
+            signal, fs = torchaudio.load(wav_path)
+        except Exception:
+            import soundfile as sf
+
+            data, fs = sf.read(wav_path, dtype="float32")
+            arr = np.asarray(data, dtype=np.float32)
+            signal = torch.from_numpy(arr.T if arr.ndim == 2 else arr)
+
+    if not isinstance(signal, torch.Tensor):
+        signal = torch.tensor(signal, dtype=torch.float32)
+
+    if signal.dim() == 1:
+        signal = signal.unsqueeze(0)
+    elif signal.dim() == 2 and signal.shape[0] > signal.shape[1]:
+        signal = signal.transpose(0, 1)
+
+    if signal.shape[0] > 1:
+        signal = signal.mean(dim=0, keepdim=True)
+
+    fs = int(fs) if fs else 16000
+    if fs != 16000:
+        import torchaudio
+
+        signal = torchaudio.functional.resample(signal, fs, 16000)
+
+    return signal
+
+
+def _ecapa_embed_path(classifier: Any, wav_path: str) -> np.ndarray:
+    """SpeechBrain ECAPA — encode_batch (encode_file not in all versions)."""
+    import torch
+
+    batch = _load_wav_tensor_16k_mono(wav_path, classifier)
+    try:
+        dev = next(classifier.parameters()).device
+    except StopIteration:
+        dev = torch.device("cpu")
+    batch = batch.to(dev)
+    with torch.no_grad():
+        emb = classifier.encode_batch(batch)
+    return np.asarray(emb.detach().cpu().numpy()).squeeze().astype(np.float64)
+
+
 def _embed_path(wav_path: str) -> list[float]:
     if not _lazy_init():
         raise RuntimeError(_INIT_ERROR or "Voice encoder not ready")
     if _ENCODER["kind"] == "ecapa":
-        emb = _ENCODER["model"].encode_file(wav_path)
-        if hasattr(emb, "detach"):
-            vec = emb.detach().cpu().numpy()
-        else:
-            vec = np.asarray(emb)
-        vec = np.asarray(vec).squeeze().astype(np.float64)
+        vec = _ecapa_embed_path(_ENCODER["model"], wav_path)
     else:
         wav = _ENCODER["preprocess_wav"](wav_path)
         vec = np.asarray(_ENCODER["encoder"].embed_utterance(wav)).flatten().astype(

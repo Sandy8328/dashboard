@@ -1,7 +1,9 @@
 # Speaker ID — SpeechBrain ECAPA (default). Optional legacy: VOICE_BACKEND=resemblyzer
-speechbrain>=1.0.0
+# Shares Kaggle venv with Coqui (torch often 2.0–2.2). voice_id.py patches torch.amp for SB 1.x.
+# If enroll still fails, upgrade: pip install "torch>=2.4,<2.6" "torchaudio>=2.4,<2.6"
+speechbrain>=1.0.0,<2.0.0
 torch>=2.0.0
-torchaudio>=2.1.0
+torchaudio>=2.1.0,<2.9.0
 huggingface_hub>=0.20.0
 hyperpyyaml>=1.2.0
 soundfile>=0.12.0
