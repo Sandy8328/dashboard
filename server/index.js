@@ -7,8 +7,8 @@ import { getAssistantResponse } from "../shared/assistant.js";
 const port = Number(process.env.PORT) || 4000;
 const useGPU = process.env.USE_GPU_MODEL === "1";
 const gpuModelUrl = process.env.GPU_MODEL_URL || "http://127.0.0.1:5000";
-const GPU_HEALTH_TIMEOUT_MS = Number(process.env.GPU_HEALTH_TIMEOUT_MS) || 15000;
-const GPU_PROXY_TIMEOUT_MS = Number(process.env.GPU_PROXY_TIMEOUT_MS) || 120000;
+const GPU_HEALTH_TIMEOUT_MS = Number(process.env.GPU_HEALTH_TIMEOUT_MS) || 90000;
+const GPU_PROXY_TIMEOUT_MS = Number(process.env.GPU_PROXY_TIMEOUT_MS) || 180000;
 
 const app = express();
 /* Wav2Lip mp4 as base64 can be several MB */
@@ -70,7 +70,7 @@ async function fetchGpu(path, { method = "GET", body, timeoutMs } = {}) {
   } catch (err) {
     if (err instanceof GpuHttpError) throw err;
     if (err && err.name === "AbortError") {
-      throw new Error(`GPU request timed out after ${Math.round(ms / 1000)}s`);
+      throw new Error(`GPU request timed out after ${Math.round(ms / 1000)}s (${url})`);
     }
     throw err;
   } finally {
@@ -97,14 +97,28 @@ function voiceErrorResponse(err, fallbackLabel) {
   };
 }
 
+function gpuProxyMeta(extra = {}) {
+  return {
+    gpu_proxy: {
+      enabled: useGPU,
+      url: gpuModelUrl,
+      health_timeout_ms: GPU_HEALTH_TIMEOUT_MS,
+      proxy_timeout_ms: GPU_PROXY_TIMEOUT_MS,
+      ...extra,
+    },
+  };
+}
+
 app.get("/", (_req, res) => {
   res.json({
     message: "Banking Operations Command Center API",
     gpu: useGPU,
+    gpu_model_url: gpuModelUrl,
     routes: [
       "GET /api/health",
       "POST /api/speech",
       "POST /api/assistant",
+      "POST /api/asr",
       "POST /api/voice/enroll",
       "POST /api/voice/identify",
       "POST /api/voice/passive",
@@ -114,13 +128,23 @@ app.get("/", (_req, res) => {
 
 app.get("/api/health", async (_req, res) => {
   if (!useGPU) {
-    return res.json({ status: "ok", gpu: false, mode: "local" });
+    return res.json({ status: "ok", gpu: false, mode: "local", ...gpuProxyMeta() });
   }
   try {
     const data = await fetchGpu("/health", { timeoutMs: GPU_HEALTH_TIMEOUT_MS });
-    res.json(data);
+    res.json({
+      ...data,
+      ...gpuProxyMeta({ connected: true }),
+    });
   } catch (err) {
-    res.status(502).json({ error: "GPU health check failed", detail: String(err) });
+    const detail = String(err?.message || err);
+    console.error("[noc] GPU health check failed:", detail);
+    res.status(502).json({
+      error: "GPU health check failed",
+      detail,
+      voice_id: { ready: false, backend: null, error: detail },
+      ...gpuProxyMeta({ connected: false, error: detail }),
+    });
   }
 });
 
@@ -138,6 +162,19 @@ app.post("/api/assistant", async (req, res) => {
     res.json(getAssistantResponse({ command, parsed }));
   } catch (err) {
     res.status(500).json({ error: String(err) });
+  }
+});
+
+app.post("/api/asr", async (req, res) => {
+  if (!useGPU) {
+    return res.status(503).json({ error: "GPU not enabled. Start with USE_GPU_MODEL=1" });
+  }
+  try {
+    res.json(await proxyToGPU("/asr", req.body || {}));
+  } catch (err) {
+    const { status, body } = voiceErrorResponse(err, "asr_failed");
+    console.error("asr proxy error:", err.message || err);
+    res.status(status).json(body);
   }
 });
 
@@ -204,7 +241,16 @@ app.post("/api/speech", async (req, res) => {
 
 app.listen(port, () => {
   console.log(`Assistant API server listening on http://localhost:${port}`);
+  console.log(`[noc] USE_GPU_MODEL=${useGPU ? "1" : "0"}`);
+  console.log(`[noc] GPU_MODEL_URL=${gpuModelUrl}`);
+  console.log(`[noc] GPU_HEALTH_TIMEOUT_MS=${GPU_HEALTH_TIMEOUT_MS}`);
+  console.log(`[noc] GPU_PROXY_TIMEOUT_MS=${GPU_PROXY_TIMEOUT_MS}`);
+  if (useGPU && (gpuModelUrl.includes("127.0.0.1") || gpuModelUrl.includes("localhost"))) {
+    console.warn(
+      "[noc] If modelServer.py runs on Kaggle, set GPU_MODEL_URL to your Kaggle tunnel URL (not 127.0.0.1)."
+    );
+  }
   if (useGPU) {
-    console.log(`GPU proxy enabled; forwarding to ${gpuModelUrl}`);
+    console.log(`[noc] GPU proxy enabled → ${gpuModelUrl}`);
   }
 });

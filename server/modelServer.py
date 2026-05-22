@@ -345,6 +345,13 @@ def health():
     except ImportError:
         voice = {"ready": False}
 
+    try:
+        from asr_gpu import status as asr_status
+
+        asr = asr_status()
+    except ImportError:
+        asr = {"ready": False, "hint": "optional faster-whisper ASR"}
+
     return {
         "status": "ok" if ready else "loading",
         "gpu": _cuda_available(),
@@ -356,6 +363,7 @@ def health():
         "hint": TTS_STARTUP_HINT,
         "talking_avatar": avatar,
         "voice_id": voice,
+        "asr": asr,
     }
 
 
@@ -450,6 +458,27 @@ def assistant(req: TextRequest):
     if not text:
         return {"reply": "How can I help, boss?"}
     return {"reply": f"Yes boss! I heard: {text}"}
+
+
+@app.post("/asr")
+def asr_transcribe(req: VoiceAudioRequest):
+    """Optional command STT when browser SpeechRecognition fails."""
+    try:
+        from asr_gpu import transcribe_base64
+
+        out = transcribe_base64(req.audio_base64, req.mime)
+        if not out.get("ok"):
+            raise HTTPException(status_code=400, detail=out)
+        return out
+    except HTTPException:
+        raise
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="asr_gpu module missing",
+        ) from None
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 if __name__ == "__main__":

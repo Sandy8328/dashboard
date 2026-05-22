@@ -11,6 +11,8 @@ import base64
 import os
 import subprocess
 import tempfile
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -30,24 +32,24 @@ BACKEND_ID = (
     else "resemblyzer"
 )
 
-# Safer defaults (override via env on Kaggle)
-_DEF_MATCH = 0.74
-_DEF_WEAK = 0.70
-_DEF_MARGIN = 0.06
-_DEF_MULTI_MATCH = 0.74
-_DEF_MULTI_WEAK = 0.70
-_DEF_MULTI_MARGIN = 0.08
+def _env_float(name: str, default: float) -> float:
+    return float(os.environ[name]) if name in os.environ else default
 
-MATCH_THRESHOLD = float(os.environ.get("VOICE_MATCH_THRESHOLD", str(_DEF_MATCH)))
-WEAK_MATCH = float(os.environ.get("VOICE_WEAK_MATCH", str(_DEF_WEAK)))
-MATCH_MARGIN = float(os.environ.get("VOICE_MATCH_MARGIN", str(_DEF_MARGIN)))
-MULTI_MATCH_THRESHOLD = float(
-    os.environ.get("VOICE_MULTI_MATCH_THRESHOLD", str(_DEF_MULTI_MATCH))
-)
-MULTI_WEAK_MATCH = float(os.environ.get("VOICE_MULTI_WEAK_MATCH", str(_DEF_MULTI_WEAK)))
-MULTI_MATCH_MARGIN = float(
-    os.environ.get("VOICE_MULTI_MATCH_MARGIN", str(_DEF_MULTI_MARGIN))
-)
+
+# ECAPA: lower thresholds for browser mic; Resemblyzer: stricter legacy defaults
+if BACKEND_ID.startswith("speechbrain"):
+    _DEF_MATCH, _DEF_WEAK, _DEF_MARGIN = 0.62, 0.55, 0.05
+    _DEF_MULTI_MATCH, _DEF_MULTI_WEAK, _DEF_MULTI_MARGIN = 0.65, 0.58, 0.07
+else:
+    _DEF_MATCH, _DEF_WEAK, _DEF_MARGIN = 0.74, 0.70, 0.06
+    _DEF_MULTI_MATCH, _DEF_MULTI_WEAK, _DEF_MULTI_MARGIN = 0.74, 0.70, 0.08
+
+MATCH_THRESHOLD = _env_float("VOICE_MATCH_THRESHOLD", _DEF_MATCH)
+WEAK_MATCH = _env_float("VOICE_WEAK_MATCH", _DEF_WEAK)
+MATCH_MARGIN = _env_float("VOICE_MATCH_MARGIN", _DEF_MARGIN)
+MULTI_MATCH_THRESHOLD = _env_float("VOICE_MULTI_MATCH_THRESHOLD", _DEF_MULTI_MATCH)
+MULTI_WEAK_MATCH = _env_float("VOICE_MULTI_WEAK_MATCH", _DEF_MULTI_WEAK)
+MULTI_MATCH_MARGIN = _env_float("VOICE_MULTI_MATCH_MARGIN", _DEF_MULTI_MARGIN)
 
 MIN_ENROLL_SEC = float(os.environ.get("VOICE_MIN_ENROLL_SEC", "4"))
 MIN_ENROLL_SPEECH_SEC = float(os.environ.get("VOICE_MIN_ENROLL_SPEECH_SEC", "3"))
@@ -62,6 +64,9 @@ MAX_CLIP_RATIO = float(os.environ.get("VOICE_MAX_CLIP_RATIO", "0.35"))
 _ENCODER = None
 _READY = False
 _INIT_ERROR = None
+_INIT_ERROR_AT = 0.0
+_INIT_LOCK = threading.Lock()
+_INIT_RETRY_COOLDOWN_SEC = float(os.environ.get("VOICE_INIT_RETRY_COOLDOWN_SEC", "90"))
 
 
 def _patch_torch_amp_compat() -> None:
@@ -128,23 +133,45 @@ def _thresholds_for_profiles(num_profiles: int) -> tuple[float, float, float]:
 
 
 def _lazy_init() -> bool:
-    global _ENCODER, _READY, _INIT_ERROR
+    global _ENCODER, _READY, _INIT_ERROR, _INIT_ERROR_AT
     if _READY:
         return True
-    if _INIT_ERROR:
-        return False
+    with _INIT_LOCK:
+        if _READY:
+            return True
+        if _INIT_ERROR:
+            if time.time() - _INIT_ERROR_AT < _INIT_RETRY_COOLDOWN_SEC:
+                return False
+            print(
+                f"[voice_id] Retrying init after cooldown ({BACKEND_ID})…"
+            )
+            _INIT_ERROR = None
+        try:
+            if BACKEND_ID.startswith("speechbrain"):
+                _ENCODER = _load_ecapa_encoder()
+            else:
+                _ENCODER = _load_resemblyzer_encoder()
+            _READY = True
+            _INIT_ERROR = None
+            print(f"Voice ID ready: {BACKEND_ID}")
+            return True
+        except Exception as exc:
+            _INIT_ERROR = str(exc)
+            _INIT_ERROR_AT = time.time()
+            print(f"Voice ID init failed ({BACKEND_ID}):", exc)
+            return False
+
+
+def _resolve_torch_device_str() -> str:
+    """SpeechBrain run_opts expects 'cuda:0', not bare 'cuda' (parser needs type:index)."""
     try:
-        if BACKEND_ID.startswith("speechbrain"):
-            _ENCODER = _load_ecapa_encoder()
-        else:
-            _ENCODER = _load_resemblyzer_encoder()
-        _READY = True
-        print(f"Voice ID ready: {BACKEND_ID}")
-        return True
-    except Exception as exc:
-        _INIT_ERROR = str(exc)
-        print(f"Voice ID init failed ({BACKEND_ID}):", exc)
-        return False
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda:0"
+    except Exception:
+        pass
+    return "cpu"
 
 
 def _load_ecapa_encoder() -> Any:
@@ -153,7 +180,7 @@ def _load_ecapa_encoder() -> Any:
     import torch
     from speechbrain.inference.speaker import EncoderClassifier
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _resolve_torch_device_str()
     print(f"Loading SpeechBrain ECAPA ({ECAPA_MODEL}) on {device}...")
     classifier = EncoderClassifier.from_hparams(
         source=ECAPA_MODEL,
@@ -162,6 +189,12 @@ def _load_ecapa_encoder() -> Any:
     )
     if hasattr(classifier, "eval"):
         classifier.eval()
+    if hasattr(classifier, "device"):
+        try:
+            classifier.device = device
+        except Exception:
+            pass
+    print(f"[voice_id] ECAPA loaded on {device} (cuda available={torch.cuda.is_available()})")
     return {"kind": "ecapa", "model": classifier, "device": device}
 
 
@@ -185,6 +218,8 @@ def status() -> dict:
         "ready": ok,
         "backend": BACKEND_ID if ok else None,
         "voice_backend": VOICE_BACKEND,
+        "voice_backend_env": VOICE_BACKEND,
+        "embedding_backend": BACKEND_ID,
         "ecapa_model": ECAPA_MODEL if BACKEND_ID.startswith("speechbrain") else None,
         "match_threshold": MATCH_THRESHOLD,
         "weak_match": WEAK_MATCH,
@@ -196,9 +231,7 @@ def status() -> dict:
         "vad": vad,
         "error": None if ok else _INIT_ERROR,
         "re_enroll_required": (
-            "Re-enroll all voices when embedding backend changes (ECAPA vs Resemblyzer)."
-            if BACKEND_ID.startswith("speechbrain")
-            else None
+            f"Re-enroll all voices when embedding backend changes (active: {BACKEND_ID})."
         ),
     }
 
@@ -396,14 +429,37 @@ def _load_wav_tensor_16k_mono(wav_path: str, classifier: Any) -> Any:
     return signal
 
 
+def _ecapa_infer_device(classifier: Any) -> Any:
+    import torch
+
+    dev = getattr(classifier, "device", None)
+    if dev is not None:
+        if isinstance(dev, str) and dev.strip() == "cuda":
+            dev = "cuda:0"
+        return torch.device(dev) if isinstance(dev, str) else dev
+    mods = getattr(classifier, "mods", None)
+    if mods is not None:
+        for mod in (mods.values() if hasattr(mods, "values") else []):
+            params_fn = getattr(mod, "parameters", None)
+            if not callable(params_fn):
+                continue
+            try:
+                return next(params_fn()).device
+            except StopIteration:
+                continue
+    if isinstance(_ENCODER, dict) and _ENCODER.get("device"):
+        d = _ENCODER["device"]
+        if isinstance(d, str) and d.strip() == "cuda":
+            d = "cuda:0"
+        return torch.device(d) if isinstance(d, str) else d
+    return torch.device(_resolve_torch_device_str())
+
+
 def _ecapa_embed_path(classifier: Any, wav_path: str) -> np.ndarray:
     import torch
 
     batch = _load_wav_tensor_16k_mono(wav_path, classifier)
-    try:
-        dev = next(classifier.parameters()).device
-    except StopIteration:
-        dev = torch.device("cpu")
+    dev = _ecapa_infer_device(classifier)
     batch = batch.to(dev)
     with torch.no_grad():
         emb = classifier.encode_batch(batch)
@@ -547,6 +603,22 @@ def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
         "accepted": False,
     }
 
+    def _log_identify(out: dict[str, Any]) -> dict[str, Any]:
+        print(
+            "[voice_id] identify",
+            f"backend={BACKEND_ID}",
+            f"top={out.get('confidence')}",
+            f"second={out.get('second_best')}",
+            f"margin={out.get('margin')}",
+            f"threshold={out.get('threshold')}",
+            f"margin_min={out.get('match_margin_min')}",
+            f"accepted={out.get('accepted')}",
+            f"matched={out.get('matched')}",
+            f"reason={out.get('reason', '')}",
+            f"name={out.get('name', '')}",
+        )
+        return out
+
     if len(compatible) == 1:
         if best_score >= th:
             base.update(
@@ -558,10 +630,10 @@ def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
                     "match_mode": "threshold",
                 }
             )
-            return base
+            return _log_identify(base)
         base["reason"] = "uncertain" if best_score >= WEAK_MATCH else "no_match"
         base["matched"] = False
-        return base
+        return _log_identify(base)
 
     if best_score >= th and margin >= margin_min:
         base.update(
@@ -573,7 +645,7 @@ def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
                 "match_mode": "threshold_margin",
             }
         )
-        return base
+        return _log_identify(base)
 
     base["matched"] = False
     if best_score >= WEAK_MATCH and margin < margin_min:
@@ -582,7 +654,7 @@ def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
         base["reason"] = "uncertain"
     else:
         base["reason"] = "no_match"
-    return base
+    return _log_identify(base)
 
 
 def identify_from_base64(
