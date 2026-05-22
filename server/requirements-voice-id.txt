@@ -9,6 +9,8 @@ hyperpyyaml>=1.2.0
 soundfile>=0.12.0
 # Passive speech gate (optional; passthrough if missing)
 silero-vad>=6.0.0
+# MFCC backend only (pip if VOICE_BACKEND=mfcc):
+# librosa>=0.10,<0.12
 # Legacy backend only (pip if VOICE_BACKEND=resemblyzer):
 # setuptools>=65.0.0,<82
 # resemblyzer>=0.1.1

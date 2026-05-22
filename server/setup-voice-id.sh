@@ -33,6 +33,11 @@ if [ "$VOICE_BACKEND" = "resemblyzer" ]; then
   PIP install "resemblyzer>=0.1.1" "librosa>=0.9,<0.11"
 fi
 
+if [ "$VOICE_BACKEND" = "mfcc" ]; then
+  echo "==> MFCC + cosine backend (librosa, CPU)"
+  PIP install "librosa>=0.10,<0.12" "soundfile>=0.12.0"
+fi
+
 echo "==> Verify ffmpeg"
 ffmpeg -version | head -n 1
 
@@ -50,5 +55,5 @@ if not vad.get('ready'):
 "
 
 echo ""
-echo "Voice ID ready (SpeechBrain ECAPA). Re-enroll all officials on Mac after upgrade."
+echo "Voice ID ready (VOICE_BACKEND=$VOICE_BACKEND). Re-enroll all officials on Mac after backend change."
 echo "Endpoints: POST /voice/enroll, /voice/identify, /voice/passive"

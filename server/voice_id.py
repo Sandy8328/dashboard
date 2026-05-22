@@ -1,6 +1,7 @@
 """
 Speaker embedding — stateless: browser stores profiles, GPU computes vectors.
 Default backend: SpeechBrain ECAPA-TDNN (spkrec-ecapa-voxceleb).
+Optional: VOICE_BACKEND=mfcc (MFCC mean/std + cosine similarity, CPU).
 Optional: VOICE_BACKEND=resemblyzer for legacy Resemblyzer.
 
 Profiles must be re-enrolled when VOICE_BACKEND / embedding space changes.
@@ -26,20 +27,32 @@ ECAPA_SAVEDIR = os.environ.get(
     os.path.join(os.path.dirname(__file__), "pretrained_models", "spkrec-ecapa-voxceleb"),
 )
 
-BACKEND_ID = (
-    "speechbrain-ecapa-voxceleb"
-    if VOICE_BACKEND in ("ecapa", "speechbrain", "ecapa-tdnn")
-    else "resemblyzer"
-)
+def _resolve_backend_id() -> str:
+    if VOICE_BACKEND in ("ecapa", "speechbrain", "ecapa-tdnn"):
+        return "speechbrain-ecapa-voxceleb"
+    if VOICE_BACKEND in ("mfcc", "mfcc-cosine"):
+        return "mfcc-cosine"
+    if VOICE_BACKEND in ("resemblyzer", "resembly"):
+        return "resemblyzer"
+    raise ValueError(
+        f"Unknown VOICE_BACKEND={VOICE_BACKEND!r}. "
+        "Use ecapa, mfcc, or resemblyzer."
+    )
+
+
+BACKEND_ID = _resolve_backend_id()
 
 def _env_float(name: str, default: float) -> float:
     return float(os.environ[name]) if name in os.environ else default
 
 
-# ECAPA: lower thresholds for browser mic; Resemblyzer: stricter legacy defaults
+# Per-backend cosine thresholds (browser mic; tune via env)
 if BACKEND_ID.startswith("speechbrain"):
     _DEF_MATCH, _DEF_WEAK, _DEF_MARGIN = 0.62, 0.55, 0.05
     _DEF_MULTI_MATCH, _DEF_MULTI_WEAK, _DEF_MULTI_MARGIN = 0.65, 0.58, 0.07
+elif BACKEND_ID == "mfcc-cosine":
+    _DEF_MATCH, _DEF_WEAK, _DEF_MARGIN = 0.78, 0.72, 0.04
+    _DEF_MULTI_MATCH, _DEF_MULTI_WEAK, _DEF_MULTI_MARGIN = 0.82, 0.76, 0.06
 else:
     _DEF_MATCH, _DEF_WEAK, _DEF_MARGIN = 0.74, 0.70, 0.06
     _DEF_MULTI_MATCH, _DEF_MULTI_WEAK, _DEF_MULTI_MARGIN = 0.74, 0.70, 0.08
@@ -149,6 +162,8 @@ def _lazy_init() -> bool:
         try:
             if BACKEND_ID.startswith("speechbrain"):
                 _ENCODER = _load_ecapa_encoder()
+            elif BACKEND_ID == "mfcc-cosine":
+                _ENCODER = _load_mfcc_encoder()
             else:
                 _ENCODER = _load_resemblyzer_encoder()
             _READY = True
@@ -205,6 +220,53 @@ def _load_resemblyzer_encoder() -> Any:
     return {"kind": "resemblyzer", "encoder": enc, "preprocess_wav": preprocess_wav}
 
 
+def _load_mfcc_encoder() -> dict[str, Any]:
+    """Lightweight CPU speaker features: MFCC mean+std, L2-normalized for cosine match."""
+    try:
+        import librosa  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "MFCC backend requires librosa. pip install 'librosa>=0.10,<0.12'"
+        ) from exc
+    n_mfcc = int(os.environ.get("VOICE_MFCC_N_COEFF", "20"))
+    n_fft = int(os.environ.get("VOICE_MFCC_N_FFT", "512"))
+    hop = int(os.environ.get("VOICE_MFCC_HOP", "160"))
+    print(
+        f"[voice_id] MFCC encoder ready n_mfcc={n_mfcc} "
+        f"n_fft={n_fft} hop={hop} dims={n_mfcc * 2}"
+    )
+    return {
+        "kind": "mfcc",
+        "n_mfcc": n_mfcc,
+        "n_fft": n_fft,
+        "hop_length": hop,
+        "dims": n_mfcc * 2,
+    }
+
+
+def _mfcc_embed_path(wav_path: str, cfg: dict[str, Any]) -> np.ndarray:
+    import librosa
+
+    y, sr = librosa.load(wav_path, sr=16000, mono=True)
+    if y.size < sr * 0.3:
+        raise ValueError("audio too short for MFCC")
+    n_mfcc = int(cfg.get("n_mfcc", 20))
+    mfcc = librosa.feature.mfcc(
+        y=y,
+        sr=sr,
+        n_mfcc=n_mfcc,
+        n_fft=int(cfg.get("n_fft", 512)),
+        hop_length=int(cfg.get("hop_length", 160)),
+    )
+    # Utterance-level CMVN
+    mfcc = mfcc - np.mean(mfcc, axis=1, keepdims=True)
+    feat = np.concatenate(
+        [np.mean(mfcc, axis=1), np.std(mfcc, axis=1)],
+        dtype=np.float64,
+    )
+    return feat
+
+
 def status() -> dict:
     ok = _lazy_init()
     vad = {"ready": False}
@@ -221,6 +283,14 @@ def status() -> dict:
         "voice_backend_env": VOICE_BACKEND,
         "embedding_backend": BACKEND_ID,
         "ecapa_model": ECAPA_MODEL if BACKEND_ID.startswith("speechbrain") else None,
+        "mfcc_n_coeff": (
+            int(os.environ.get("VOICE_MFCC_N_COEFF", "20"))
+            if BACKEND_ID == "mfcc-cosine"
+            else None
+        ),
+        "mfcc_embedding_dims": (
+            (_ENCODER or {}).get("dims") if BACKEND_ID == "mfcc-cosine" and _ENCODER else None
+        ),
         "match_threshold": MATCH_THRESHOLD,
         "weak_match": WEAK_MATCH,
         "match_margin": MATCH_MARGIN,
@@ -469,8 +539,11 @@ def _ecapa_embed_path(classifier: Any, wav_path: str) -> np.ndarray:
 def _embed_path(wav_path: str) -> list[float]:
     if not _lazy_init():
         raise RuntimeError(_INIT_ERROR or "Voice encoder not ready")
-    if _ENCODER["kind"] == "ecapa":
+    kind = _ENCODER["kind"]
+    if kind == "ecapa":
         vec = _ecapa_embed_path(_ENCODER["model"], wav_path)
+    elif kind == "mfcc":
+        vec = _mfcc_embed_path(wav_path, _ENCODER)
     else:
         wav = _ENCODER["preprocess_wav"](wav_path)
         vec = np.asarray(_ENCODER["encoder"].embed_utterance(wav)).flatten().astype(
@@ -499,9 +572,6 @@ def _compatible_profiles(profiles: list[dict]) -> list[dict]:
     for p in profiles:
         pb = (p.get("embedding_backend") or p.get("embeddingBackend") or "").strip()
         if not pb:
-            if BACKEND_ID.startswith("speechbrain"):
-                continue
-            out.append(p)
             continue
         if pb == BACKEND_ID:
             out.append(p)
