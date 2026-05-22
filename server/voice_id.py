@@ -2,6 +2,8 @@
 Speaker embedding — stateless: browser stores profiles, GPU computes vectors.
 Default backend: SpeechBrain ECAPA-TDNN (spkrec-ecapa-voxceleb).
 Optional: VOICE_BACKEND=resemblyzer for legacy Resemblyzer.
+
+Profiles must be re-enrolled when VOICE_BACKEND / embedding space changes.
 """
 from __future__ import annotations
 
@@ -28,20 +30,13 @@ BACKEND_ID = (
     else "resemblyzer"
 )
 
-if BACKEND_ID.startswith("speechbrain"):
-    _DEF_MATCH = 0.70
-    _DEF_WEAK = 0.65
-    _DEF_MARGIN = 0.05
-    _DEF_MULTI_MATCH = 0.68
-    _DEF_MULTI_WEAK = 0.63
-    _DEF_MULTI_MARGIN = 0.06
-else:
-    _DEF_MATCH = 0.64
-    _DEF_WEAK = 0.62
-    _DEF_MARGIN = 0.07
-    _DEF_MULTI_MATCH = 0.60
-    _DEF_MULTI_WEAK = 0.56
-    _DEF_MULTI_MARGIN = 0.08
+# Safer defaults (override via env on Kaggle)
+_DEF_MATCH = 0.74
+_DEF_WEAK = 0.70
+_DEF_MARGIN = 0.06
+_DEF_MULTI_MATCH = 0.74
+_DEF_MULTI_WEAK = 0.70
+_DEF_MULTI_MARGIN = 0.08
 
 MATCH_THRESHOLD = float(os.environ.get("VOICE_MATCH_THRESHOLD", str(_DEF_MATCH)))
 WEAK_MATCH = float(os.environ.get("VOICE_WEAK_MATCH", str(_DEF_WEAK)))
@@ -53,8 +48,16 @@ MULTI_WEAK_MATCH = float(os.environ.get("VOICE_MULTI_WEAK_MATCH", str(_DEF_MULTI
 MULTI_MATCH_MARGIN = float(
     os.environ.get("VOICE_MULTI_MATCH_MARGIN", str(_DEF_MULTI_MARGIN))
 )
+
 MIN_ENROLL_SEC = float(os.environ.get("VOICE_MIN_ENROLL_SEC", "4"))
-PASSIVE_MIN_SEC = float(os.environ.get("VOICE_PASSIVE_MIN_SEC", "0.35"))
+MIN_ENROLL_SPEECH_SEC = float(os.environ.get("VOICE_MIN_ENROLL_SPEECH_SEC", "3"))
+MIN_IDENTIFY_SEC = float(os.environ.get("VOICE_MIN_IDENTIFY_SEC", "1.2"))
+MIN_IDENTIFY_SPEECH_SEC = float(os.environ.get("VOICE_MIN_IDENTIFY_SPEECH_SEC", "0.8"))
+PASSIVE_MIN_SEC = float(os.environ.get("VOICE_PASSIVE_MIN_SEC", "1.0"))
+
+MIN_RMS = float(os.environ.get("VOICE_MIN_RMS", "0.008"))
+MIN_PEAK = float(os.environ.get("VOICE_MIN_PEAK", "0.02"))
+MAX_CLIP_RATIO = float(os.environ.get("VOICE_MAX_CLIP_RATIO", "0.35"))
 
 _ENCODER = None
 _READY = False
@@ -62,10 +65,6 @@ _INIT_ERROR = None
 
 
 def _patch_torch_amp_compat() -> None:
-    """
-    SpeechBrain 1.x uses torch.amp.custom_fwd (PyTorch>=2.4).
-    Coqui Kaggle venv often has torch 2.0–2.2 — map to torch.cuda.amp.
-    """
     try:
         import torch
     except Exception:
@@ -99,7 +98,6 @@ def _patch_torch_amp_compat() -> None:
 
 
 def _patch_torchaudio_compat() -> None:
-    """SpeechBrain 1.x may call torchaudio.list_audio_backends (removed in torchaudio 2.9+)."""
     try:
         import torchaudio
     except Exception:
@@ -111,6 +109,16 @@ def _patch_torchaudio_compat() -> None:
 if BACKEND_ID.startswith("speechbrain"):
     _patch_torch_amp_compat()
     _patch_torchaudio_compat()
+
+
+def _reject(reason: str, **details: Any) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "matched": False,
+        "reason": reason,
+        "details": details,
+        "embedding_backend": BACKEND_ID,
+    }
 
 
 def _thresholds_for_profiles(num_profiles: int) -> tuple[float, float, float]:
@@ -182,10 +190,13 @@ def status() -> dict:
         "weak_match": WEAK_MATCH,
         "match_margin": MATCH_MARGIN,
         "multi_match_threshold": MULTI_MATCH_THRESHOLD,
+        "multi_match_margin": MULTI_MATCH_MARGIN,
+        "min_enroll_sec": MIN_ENROLL_SEC,
+        "min_identify_sec": MIN_IDENTIFY_SEC,
         "vad": vad,
         "error": None if ok else _INIT_ERROR,
         "re_enroll_required": (
-            "Old Resemblyzer profiles must be re-enrolled after switching to ECAPA."
+            "Re-enroll all voices when embedding backend changes (ECAPA vs Resemblyzer)."
             if BACKEND_ID.startswith("speechbrain")
             else None
         ),
@@ -194,6 +205,8 @@ def status() -> dict:
 
 def _write_b64(path: str, b64: str) -> None:
     raw = base64.b64decode(b64)
+    if not raw or len(raw) < 32:
+        raise ValueError("audio_base64 empty or too small")
     with open(path, "wb") as f:
         f.write(raw)
 
@@ -222,8 +235,93 @@ def _to_wav_16k(src_path: str, dst_path: str) -> None:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr or proc.stdout}")
 
 
+def _wav_duration_sec(path: str) -> float:
+    import wave
+
+    with wave.open(path, "rb") as wf:
+        return wf.getnframes() / float(wf.getframerate())
+
+
+def _read_wav_mono_float(path: str) -> tuple[np.ndarray, int]:
+    import wave
+
+    with wave.open(path, "rb") as wf:
+        rate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+        sw = wf.getsampwidth()
+    if sw == 2:
+        samples = np.frombuffer(frames, dtype=np.int16).astype(np.float64) / 32768.0
+    elif sw == 4:
+        samples = np.frombuffer(frames, dtype=np.int32).astype(np.float64) / 2147483648.0
+    else:
+        raise ValueError(f"unsupported wav sample width: {sw}")
+    return samples, rate
+
+
+def _vad_for_wav(wav_path: str) -> dict[str, Any]:
+    try:
+        from vad_gate import analyze_wav_16k
+
+        return analyze_wav_16k(wav_path)
+    except Exception as exc:
+        return {
+            "speech_detected": True,
+            "speech_seconds": 0.0,
+            "vad_backend": "passthrough",
+            "note": str(exc),
+        }
+
+
+def _analyze_audio_quality(
+    wav_path: str,
+    *,
+    min_duration_sec: float,
+    min_speech_sec: float,
+) -> dict[str, Any]:
+    """Gate silence/clipped/short clips before embedding."""
+    try:
+        samples, rate = _read_wav_mono_float(wav_path)
+    except Exception as exc:
+        return _reject("invalid_audio", error=str(exc))
+
+    if samples.size < 8 or rate < 8000:
+        return _reject("invalid_audio", samples=len(samples), sample_rate=rate)
+
+    duration_sec = float(samples.size) / float(rate)
+    rms = float(np.sqrt(np.mean(samples * samples)))
+    peak = float(np.max(np.abs(samples)))
+    clip_ratio = float(np.mean(np.abs(samples) > 0.98))
+
+    vad = _vad_for_wav(wav_path)
+    speech_sec = float(vad.get("speech_seconds") or 0.0)
+    # Do not invent speech duration on passthrough — avoids embedding silence/noise.
+
+    details = {
+        "duration_sec": round(duration_sec, 3),
+        "speech_sec": round(speech_sec, 3),
+        "rms": round(rms, 5),
+        "peak": round(peak, 5),
+        "clip_ratio": round(clip_ratio, 4),
+        "min_duration_sec": min_duration_sec,
+        "min_speech_sec": min_speech_sec,
+        "vad": vad,
+    }
+
+    if duration_sec < min_duration_sec:
+        return _reject("audio_too_short", **details)
+    if speech_sec < min_speech_sec:
+        return _reject("insufficient_speech", **details)
+    if rms < MIN_RMS:
+        return _reject("rms_too_low", **details)
+    if peak < MIN_PEAK:
+        return _reject("peak_too_low", **details)
+    if clip_ratio > MAX_CLIP_RATIO:
+        return _reject("clipping_too_high", **details)
+
+    return {"ok": True, "details": details}
+
+
 def _load_wav_tensor_16k_mono(wav_path: str, classifier: Any) -> Any:
-    """Load 16 kHz mono waveform as [batch=1, time] for encode_batch."""
     import torch
 
     signal = None
@@ -271,7 +369,6 @@ def _load_wav_tensor_16k_mono(wav_path: str, classifier: Any) -> Any:
 
 
 def _ecapa_embed_path(classifier: Any, wav_path: str) -> np.ndarray:
-    """SpeechBrain ECAPA — encode_batch (encode_file not in all versions)."""
     import torch
 
     batch = _load_wav_tensor_16k_mono(wav_path, classifier)
@@ -318,7 +415,6 @@ def _compatible_profiles(profiles: list[dict]) -> list[dict]:
     for p in profiles:
         pb = (p.get("embedding_backend") or p.get("embeddingBackend") or "").strip()
         if not pb:
-            # Legacy Resemblyzer profiles — skip when using ECAPA
             if BACKEND_ID.startswith("speechbrain"):
                 continue
             out.append(p)
@@ -328,42 +424,64 @@ def _compatible_profiles(profiles: list[dict]) -> list[dict]:
     return out
 
 
+def _decode_to_wav(audio_b64: str, mime: str, tmp: str) -> str:
+    ext = ".webm" if "webm" in (mime or "") else ".bin"
+    src = os.path.join(tmp, "in" + ext)
+    wav = os.path.join(tmp, "audio.wav")
+    _write_b64(src, audio_b64)
+    _to_wav_16k(src, wav)
+    return wav
+
+
 def embed_from_base64(audio_b64: str, mime: str = "audio/webm") -> dict[str, Any]:
     if not audio_b64:
-        raise ValueError("audio_base64 required")
+        return _reject("no_audio")
     with tempfile.TemporaryDirectory() as tmp:
-        ext = ".webm" if "webm" in (mime or "") else ".bin"
-        src = os.path.join(tmp, "in" + ext)
-        wav = os.path.join(tmp, "audio.wav")
-        _write_b64(src, audio_b64)
-        _to_wav_16k(src, wav)
-        dur = _wav_duration_sec(wav)
-        if dur < MIN_ENROLL_SEC:
-            raise ValueError(
-                f"audio too short ({dur:.1f}s); speak at least {MIN_ENROLL_SEC:.0f}s"
-            )
+        wav = _decode_to_wav(audio_b64, mime, tmp)
+        quality = _analyze_audio_quality(
+            wav,
+            min_duration_sec=MIN_ENROLL_SEC,
+            min_speech_sec=MIN_ENROLL_SPEECH_SEC,
+        )
+        if not quality.get("ok"):
+            return quality
         embedding = _embed_path(wav)
+        dur = _wav_duration_sec(wav)
         return {
+            "ok": True,
             "embedding": embedding,
             "duration_ms": int(dur * 1000),
             "dims": len(embedding),
             "embedding_backend": BACKEND_ID,
+            "audio_quality": quality.get("details"),
         }
 
 
 def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
+    quality = _analyze_audio_quality(
+        wav_path,
+        min_duration_sec=MIN_IDENTIFY_SEC,
+        min_speech_sec=MIN_IDENTIFY_SPEECH_SEC,
+    )
+    if not quality.get("ok"):
+        out = dict(quality)
+        out["accepted"] = False
+        return out
+
     compatible = _compatible_profiles(profiles)
     if not profiles:
-        return {"matched": False, "reason": "no_profiles", "embedding_backend": BACKEND_ID}
+        return {**_reject("no_profiles"), "accepted": False}
     if not compatible:
         return {
-            "matched": False,
-            "reason": "stale_embeddings",
-            "embedding_backend": BACKEND_ID,
-            "profile_count": len(profiles),
-            "compatible_count": 0,
-            "hint": "Re-enroll all voices after SpeechBrain upgrade (clear profiles, register again).",
+            **_reject(
+                "stale_embeddings",
+                profile_count=len(profiles),
+                compatible_count=0,
+                hint="Re-enroll all voices after backend change.",
+            ),
+            "accepted": False,
         }
+
     probe = np.asarray(_embed_path(wav_path), dtype=np.float64)
     ranked: list[tuple[float, dict]] = []
     for p in compatible:
@@ -374,60 +492,80 @@ def _identify_wav_path(wav_path: str, profiles: list[dict]) -> dict[str, Any]:
         ranked.append((score, p))
     if not ranked:
         return {
-            "matched": False,
-            "confidence": 0.0,
-            "threshold": MATCH_THRESHOLD,
-            "reason": "no_embeddings",
-            "embedding_backend": BACKEND_ID,
+            **_reject("no_embeddings", compatible_count=len(compatible)),
+            "accepted": False,
         }
+
     ranked.sort(key=lambda x: x[0], reverse=True)
     best_score, best = ranked[0]
     second_score = ranked[1][0] if len(ranked) > 1 else 0.0
     second_profile = ranked[1][1] if len(ranked) > 1 else None
     margin = float(best_score - second_score)
     conf = round(max(0.0, best_score), 3)
-    th, weak, margin_min = _thresholds_for_profiles(len(compatible))
-    base = {
+    th, _weak, margin_min = _thresholds_for_profiles(len(compatible))
+
+    base: dict[str, Any] = {
+        "ok": True,
         "confidence": conf,
         "second_best": round(max(0.0, second_score), 3),
         "second_best_name": (second_profile or {}).get("name"),
         "margin": round(max(0.0, margin), 3),
         "threshold": th,
-        "weak_threshold": weak,
         "match_margin_min": margin_min,
         "profile_count": len(profiles),
         "compatible_count": len(compatible),
         "embedding_backend": BACKEND_ID,
+        "audio_quality": quality.get("details"),
+        "accepted": False,
     }
-    matched = False
-    match_mode = None
-    if best_score >= th:
-        matched = True
-        match_mode = "threshold"
-    elif best_score >= weak and margin >= margin_min:
-        matched = True
-        match_mode = "weak_margin"
-    if matched and best is not None:
-        return {
-            **base,
-            "matched": True,
-            "id": best.get("id"),
-            "name": best.get("name"),
-            "match_mode": match_mode,
-        }
-    return {**base, "matched": False, "reason": "no_match"}
+
+    if len(compatible) == 1:
+        if best_score >= th:
+            base.update(
+                {
+                    "matched": True,
+                    "accepted": True,
+                    "id": best.get("id"),
+                    "name": best.get("name"),
+                    "match_mode": "threshold",
+                }
+            )
+            return base
+        base["reason"] = "uncertain" if best_score >= WEAK_MATCH else "no_match"
+        base["matched"] = False
+        return base
+
+    if best_score >= th and margin >= margin_min:
+        base.update(
+            {
+                "matched": True,
+                "accepted": True,
+                "id": best.get("id"),
+                "name": best.get("name"),
+                "match_mode": "threshold_margin",
+            }
+        )
+        return base
+
+    base["matched"] = False
+    if best_score >= WEAK_MATCH and margin < margin_min:
+        base["reason"] = "uncertain"
+    elif best_score >= WEAK_MATCH:
+        base["reason"] = "uncertain"
+    else:
+        base["reason"] = "no_match"
+    return base
 
 
 def identify_from_base64(
     audio_b64: str, profiles: list[dict], mime: str = "audio/webm"
 ) -> dict[str, Any]:
+    if not audio_b64:
+        return {**_reject("no_audio"), "accepted": False}
     if not profiles:
-        return {"matched": False, "reason": "no_profiles", "embedding_backend": BACKEND_ID}
+        return {**_reject("no_profiles"), "accepted": False}
     with tempfile.TemporaryDirectory() as tmp:
-        src = os.path.join(tmp, "probe.webm")
-        wav = os.path.join(tmp, "probe.wav")
-        _write_b64(src, audio_b64)
-        _to_wav_16k(src, wav)
+        wav = _decode_to_wav(audio_b64, mime, tmp)
         return _identify_wav_path(wav, profiles)
 
 
@@ -438,25 +576,14 @@ def passive_from_base64(
     transcript: str = "",
 ) -> dict[str, Any]:
     if not audio_b64:
-        return {"matched": False, "reason": "no_audio", "speech_detected": False}
-    try:
-        from vad_gate import analyze_wav_16k
-    except Exception:
-        analyze_wav_16k = None  # type: ignore
-
+        return {"matched": False, "reason": "no_audio", "speech_detected": False, "ok": False}
     with tempfile.TemporaryDirectory() as tmp:
-        src = os.path.join(tmp, "passive.webm")
-        wav = os.path.join(tmp, "passive.wav")
-        _write_b64(src, audio_b64)
-        _to_wav_16k(src, wav)
+        wav = _decode_to_wav(audio_b64, mime, tmp)
         dur = _wav_duration_sec(wav)
-        vad_info = (
-            analyze_wav_16k(wav)
-            if analyze_wav_16k
-            else {"speech_detected": True, "vad_backend": "passthrough"}
-        )
+        vad_info = _vad_for_wav(wav)
         if not vad_info.get("speech_detected"):
             return {
+                "ok": False,
                 "matched": False,
                 "reason": "no_speech",
                 "speech_detected": False,
@@ -465,6 +592,7 @@ def passive_from_base64(
             }
         if dur < PASSIVE_MIN_SEC:
             return {
+                "ok": False,
                 "matched": False,
                 "reason": "audio_too_short",
                 "speech_detected": True,
@@ -474,6 +602,7 @@ def passive_from_base64(
             }
         if not profiles:
             return {
+                "ok": False,
                 "matched": False,
                 "reason": "no_profiles",
                 "speech_detected": True,
@@ -487,10 +616,3 @@ def passive_from_base64(
         out["transcript"] = (transcript or "").strip()
         out["passive"] = True
         return out
-
-
-def _wav_duration_sec(path: str) -> float:
-    import wave
-
-    with wave.open(path, "rb") as wf:
-        return wf.getnframes() / float(wf.getframerate())

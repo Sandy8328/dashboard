@@ -391,7 +391,10 @@ def voice_enroll(req: VoiceAudioRequest):
                 status_code=503,
                 detail=st.get("error") or "Voice ID not ready. Run: bash setup-voice-id.sh",
             )
-        return embed_from_base64(req.audio_base64, req.mime)
+        out = embed_from_base64(req.audio_base64, req.mime)
+        if isinstance(out, dict) and out.get("ok") is False:
+            raise HTTPException(status_code=400, detail=out)
+        return out
     except HTTPException:
         raise
     except ValueError as exc:
