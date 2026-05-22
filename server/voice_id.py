@@ -258,6 +258,22 @@ def _read_wav_mono_float(path: str) -> tuple[np.ndarray, int]:
     return samples, rate
 
 
+def _energy_speech_seconds(samples: np.ndarray, rate: int) -> float:
+    """Frame RMS speech estimate when Silero VAD is unavailable."""
+    frame = max(1, int(rate * 0.03))
+    thresh = max(MIN_RMS * 2.5, 0.012)
+    speech_frames = 0
+    total_frames = 0
+    for i in range(0, len(samples) - frame, frame):
+        chunk = samples[i : i + frame]
+        if float(np.sqrt(np.mean(chunk * chunk))) >= thresh:
+            speech_frames += 1
+        total_frames += 1
+    if total_frames < 1:
+        return 0.0
+    return (speech_frames * frame) / float(rate)
+
+
 def _vad_for_wav(wav_path: str) -> dict[str, Any]:
     try:
         from vad_gate import analyze_wav_16k
@@ -294,7 +310,19 @@ def _analyze_audio_quality(
 
     vad = _vad_for_wav(wav_path)
     speech_sec = float(vad.get("speech_seconds") or 0.0)
-    # Do not invent speech duration on passthrough — avoids embedding silence/noise.
+    vad_backend = str(vad.get("vad_backend") or "")
+    if speech_sec < min_speech_sec and vad_backend in (
+        "passthrough",
+        "error_passthrough",
+    ):
+        energy_sec = _energy_speech_seconds(samples, rate)
+        if energy_sec > speech_sec:
+            speech_sec = energy_sec
+            vad = {
+                **vad,
+                "speech_seconds_energy": round(energy_sec, 3),
+                "vad_backend": vad_backend + "+energy",
+            }
 
     details = {
         "duration_sec": round(duration_sec, 3),

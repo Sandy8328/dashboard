@@ -7,23 +7,94 @@ import { getAssistantResponse } from "../shared/assistant.js";
 const port = Number(process.env.PORT) || 4000;
 const useGPU = process.env.USE_GPU_MODEL === "1";
 const gpuModelUrl = process.env.GPU_MODEL_URL || "http://127.0.0.1:5000";
+const GPU_HEALTH_TIMEOUT_MS = Number(process.env.GPU_HEALTH_TIMEOUT_MS) || 15000;
+const GPU_PROXY_TIMEOUT_MS = Number(process.env.GPU_PROXY_TIMEOUT_MS) || 120000;
 
 const app = express();
 /* Wav2Lip mp4 as base64 can be several MB */
 app.use(express.json({ limit: "100mb" }));
 
-async function proxyToGPU(path, body) {
-  const url = `${gpuModelUrl}${path}`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`GPU ${response.status}: ${detail}`);
+class GpuHttpError extends Error {
+  constructor(status, detail, body) {
+    const msg =
+      typeof detail === "string"
+        ? detail
+        : detail != null
+          ? JSON.stringify(detail)
+          : `GPU ${status}`;
+    super(msg);
+    this.name = "GpuHttpError";
+    this.status = status;
+    this.detail = detail;
+    this.body = body;
   }
-  return response.json();
+}
+
+function parseGpuErrorBody(text) {
+  if (!text) return null;
+  try {
+    const j = JSON.parse(text);
+    if (j && j.detail != null) {
+      return typeof j.detail === "object" ? j.detail : { reason: String(j.detail), detail: j.detail };
+    }
+    return j;
+  } catch {
+    return { reason: text, detail: text };
+  }
+}
+
+async function fetchGpu(path, { method = "GET", body, timeoutMs } = {}) {
+  const url = `${gpuModelUrl}${path}`;
+  const ms = timeoutMs ?? (method === "GET" ? GPU_HEALTH_TIMEOUT_MS : GPU_PROXY_TIMEOUT_MS);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      const parsed = parseGpuErrorBody(text);
+      const detail = parsed?.detail ?? parsed?.reason ?? parsed ?? text;
+      throw new GpuHttpError(response.status, detail, parsed);
+    }
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { raw: text };
+    }
+  } catch (err) {
+    if (err instanceof GpuHttpError) throw err;
+    if (err && err.name === "AbortError") {
+      throw new Error(`GPU request timed out after ${Math.round(ms / 1000)}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function proxyToGPU(path, body) {
+  return fetchGpu(path, { method: "POST", body, timeoutMs: GPU_PROXY_TIMEOUT_MS });
+}
+
+function voiceErrorResponse(err, fallbackLabel) {
+  if (err instanceof GpuHttpError) {
+    const status = err.status >= 400 && err.status < 600 ? err.status : 502;
+    const body =
+      err.body && typeof err.body === "object"
+        ? err.body
+        : { ok: false, reason: String(err.detail || fallbackLabel), detail: err.detail };
+    return { status, body };
+  }
+  return {
+    status: 502,
+    body: { ok: false, reason: fallbackLabel, detail: String(err?.message || err) },
+  };
 }
 
 app.get("/", (_req, res) => {
@@ -46,8 +117,7 @@ app.get("/api/health", async (_req, res) => {
     return res.json({ status: "ok", gpu: false, mode: "local" });
   }
   try {
-    const r = await fetch(`${gpuModelUrl}/health`);
-    const data = await r.json();
+    const data = await fetchGpu("/health", { timeoutMs: GPU_HEALTH_TIMEOUT_MS });
     res.json(data);
   } catch (err) {
     res.status(502).json({ error: "GPU health check failed", detail: String(err) });
@@ -78,8 +148,9 @@ app.post("/api/voice/enroll", async (req, res) => {
   try {
     res.json(await proxyToGPU("/voice/enroll", req.body || {}));
   } catch (err) {
-    console.error("voice enroll error:", err.message);
-    res.status(502).json({ error: "Voice enroll failed", detail: err.message });
+    const { status, body } = voiceErrorResponse(err, "voice_enroll_failed");
+    console.error("voice enroll error:", err.message || err);
+    res.status(status).json(body);
   }
 });
 
@@ -90,8 +161,9 @@ app.post("/api/voice/identify", async (req, res) => {
   try {
     res.json(await proxyToGPU("/voice/identify", req.body || {}));
   } catch (err) {
-    console.error("voice identify error:", err.message);
-    res.status(502).json({ error: "Voice identify failed", detail: err.message });
+    const { status, body } = voiceErrorResponse(err, "voice_identify_failed");
+    console.error("voice identify error:", err.message || err);
+    res.status(status).json(body);
   }
 });
 
@@ -102,8 +174,9 @@ app.post("/api/voice/passive", async (req, res) => {
   try {
     res.json(await proxyToGPU("/voice/passive", req.body || {}));
   } catch (err) {
-    console.error("voice passive error:", err.message);
-    res.status(502).json({ error: "Voice passive failed", detail: err.message });
+    const { status, body } = voiceErrorResponse(err, "voice_passive_failed");
+    console.error("voice passive error:", err.message || err);
+    res.status(status).json(body);
   }
 });
 
